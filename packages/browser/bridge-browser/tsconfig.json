@@ -1,0 +1,25 @@
+{
+  "extends": "../../../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    { "path": "../../../../vendor/cordis" },
+    { "path": "../../../../vendor/schemastery" },
+    { "path": "../../../../packages/core/agent" },
+    { "path": "../../../../packages/core/agent-loop" },
+    { "path": "../../../../packages/core/session" },
+    { "path": "../../../../packages/core/system-prompt" },
+    { "path": "../../../../packages/core/tools" },
+    { "path": "../../../../packages/host/apiproxy" },
+    { "path": "../../../../packages/host/webserver" },
+    { "path": "../../../../packages/llm/llm" },
+    { "path": "../../../../packages/support/invariants" },
+    { "path": "../../../../packages/ui/user-interaction" },
+    { "path": "../../../../packages/util/paths" }
+  ]
+}

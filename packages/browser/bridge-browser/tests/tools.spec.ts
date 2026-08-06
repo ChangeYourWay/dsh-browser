@@ -1,0 +1,130 @@
+import { describe, expect, it, vi } from 'vitest'
+import type { Context } from 'cordis'
+import type { BridgeServer } from '../src/server.ts'
+import { BROWSER_TOOL_NAMES, registerBrowserTools } from '../src/tools.ts'
+
+describe('registerBrowserTools', () => {
+  function makeHarness() {
+    const registered: { name: string; definition: Record<string, unknown> }[] = []
+    const ctx = {
+      tools: {
+        register: vi.fn((definition: { name: string }) => {
+          registered.push({ name: definition.name, definition: definition as Record<string, unknown> })
+          return () => {}
+        }),
+      },
+    } as unknown as Context
+    const requestTool = vi.fn(async (_name: string, _args: Record<string, unknown>, _signal: AbortSignal, _timeoutMs?: number): Promise<unknown> => {
+      return { text: 'ok' }
+    })
+    const bridge = { requestTool } as unknown as BridgeServer
+    return { ctx, bridge, requestTool, registered }
+  }
+
+  it('registers the full v1 tool set', () => {
+    const { ctx, bridge, registered } = makeHarness()
+    const disposers = registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    expect(registered.map((r) => r.name).sort()).toEqual([...BROWSER_TOOL_NAMES].sort())
+    expect(disposers.size).toBe(BROWSER_TOOL_NAMES.length)
+    for (const dispose of disposers.values()) dispose()
+  })
+
+  it('executes browser_click with mapped args', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_click')!
+    const exec = { signal: new AbortController().signal }
+    const result = await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({ index: 3 }, exec)
+    expect(requestTool).toHaveBeenCalledWith('browser_click', { index: 3 }, exec.signal, 1_000)
+    expect(result).toEqual({ text: 'ok' })
+  })
+
+  it('normalizes snapshot args (delta/region omitted when absent)', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_snapshot')!
+    const exec = { signal: new AbortController().signal }
+    await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({ delta: true }, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_snapshot', { delta: true }, exec.signal, 1_000)
+    await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({}, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_snapshot', {}, exec.signal, 1_000)
+    await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({ delta: true, region: 'main' }, exec)
+    expect(requestTool).toHaveBeenLastCalledWith('browser_snapshot', { delta: true, region: 'main' }, exec.signal, 1_000)
+  })
+
+  it('executes every remaining tool with mapped args', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const byName = new Map(registered.map((r) => [r.name, r.definition]))
+    const exec = { signal: new AbortController().signal }
+    const run = async (name: string, args: unknown): Promise<void> => {
+      await (byName.get(name)!.execute as (a: unknown, e: { signal: AbortSignal }) => Promise<unknown>)(args, exec)
+    }
+
+    await run('browser_type', { index: 2, text: 'hello' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_type', { index: 2, text: 'hello' }, exec.signal, 1_000)
+    await run('browser_type', { index: 2, text: 'hello', replace: true })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_type', { index: 2, text: 'hello', replace: true }, exec.signal, 1_000)
+
+    await run('browser_press', { key: 'Enter' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_press', { key: 'Enter' }, exec.signal, 1_000)
+
+    await run('browser_scroll', { direction: 'down', amount: 200 })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_scroll', { direction: 'down', amount: 200 }, exec.signal, 1_000)
+    await run('browser_scroll', { direction: 'top' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_scroll', { direction: 'top' }, exec.signal, 1_000)
+
+    await run('browser_navigate', { url: 'https://example.com' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_navigate', { url: 'https://example.com' }, exec.signal, 1_000)
+
+    for (const name of ['browser_back', 'browser_forward', 'browser_reload'] as const) {
+      await run(name, {})
+      expect(requestTool).toHaveBeenLastCalledWith(name, {}, exec.signal, 1_000)
+    }
+
+    await run('browser_get_text', { selector: '#main' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_get_text', { selector: '#main' }, exec.signal, 1_000)
+    await run('browser_get_text', {})
+    expect(requestTool).toHaveBeenLastCalledWith('browser_get_text', {}, exec.signal, 1_000)
+
+    await run('browser_wait', { ms: 100 })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_wait', { ms: 100 }, exec.signal, 1_000)
+    await run('browser_wait', {})
+    expect(requestTool).toHaveBeenLastCalledWith('browser_wait', {}, exec.signal, 1_000)
+  })
+
+  it('declares a JSON Schema object root on every tool (empty objects serialize to type:null and get 400)', () => {
+    const { ctx, bridge, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    for (const { definition } of registered) {
+      const params = definition.parameters as { type?: unknown }
+      expect(params.type).toBe('object')
+    }
+  })
+
+  it('declares cooperative timeoutMs on every tool', () => {
+    const { ctx, bridge, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 5_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    for (const { definition } of registered) {
+      expect(definition.timeoutMs).toBe(5_000)
+    }
+  })
+
+  it('falls back to a no-text payload when the extension returns non-text', async () => {
+    const { ctx, bridge, requestTool, registered } = makeHarness()
+    requestTool.mockResolvedValueOnce(null)
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_wait')!
+    const exec = { signal: new AbortController().signal }
+    const result = await (tool.definition.execute as (args: unknown, e: { signal: AbortSignal }) => Promise<unknown>)({}, exec)
+    expect(result).toEqual({ text: expect.stringContaining('no text') })
+  })
+
+  it('renders the canonical result as one text block', () => {
+    const { ctx, bridge, registered } = makeHarness()
+    registerBrowserTools(ctx, bridge, { toolTimeoutMs: 1_000, snapshotMaxChars: 12_000, maxInteractiveItems: 60 })
+    const tool = registered.find((r) => r.name === 'browser_click')!
+    const output = tool.definition.output as { render: (args: unknown, value: unknown) => unknown }
+    expect(output.render({}, { text: 'hello' })).toEqual([{ type: 'text', text: 'hello' }])
+  })
+})

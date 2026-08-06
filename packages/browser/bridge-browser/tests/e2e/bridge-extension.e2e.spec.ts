@@ -1,0 +1,287 @@
+/**
+ * End-to-end: the real Chrome extension connects to a REAL dsh composition.
+ *
+ * Boots the bridge composition through the vendored Loader (webserver +
+ * minimal spine + api host + workspace/storage plugins + bridge plugin, same
+ * shape as composition.spec), launches a real Chromium with the built
+ * extension (`--load-extension`), pins the bridge through the panel's real
+ * settings UI (URL + token, so the extension targets THIS composition instead
+ * of whatever auto-discovery finds on the machine), and asserts the full
+ * chain: panel → background SW → bridge WebSocket → token hello → caps →
+ * status push → deferred session.create (no store trace) → first prompt
+ * materializes the session inside the dedicated workspace group.
+ *
+ * Self-skips without a usable Chromium (env `PLAYWRIGHT_CHROMIUM_PATH` or the
+ * Playwright cache) or without a built extension dist. Run:
+ *   pnpm --filter @deepseek-ai/dsh-bridge-browser exec vitest run tests/e2e/bridge-extension.e2e.ts
+ */
+
+import { mkdirSync } from 'node:fs'
+import { existsSync } from 'node:fs'
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { Context } from 'cordis'
+import Loader from '@cordisjs/plugin-loader'
+import Include from '@cordisjs/plugin-include'
+import { chromium, type BrowserContext } from 'playwright-core'
+import HttpServer from '@deepseek-ai/dsh-host-webserver'
+import SessionStore from '@deepseek-ai/dsh-session'
+import UserInteractionService from '@deepseek-ai/dsh-user-interaction'
+import AgentRegistry from '@deepseek-ai/dsh-agent'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRegistry from '@deepseek-ai/dsh-tools'
+import LlmService from '@deepseek-ai/dsh-llm'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
+import Storage from '@deepseek-ai/dsh-storage'
+import * as StorageJson from '@deepseek-ai/dsh-storage-json'
+import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
+import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
+import * as BridgeBrowser from '../../src/index.ts'
+
+const BRIDGE = '@deepseek-ai/dsh-bridge-browser'
+const TOKEN = 'e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0'
+
+/** Header-only persistence peer required by the real Workspace registry. */
+const SessionPersistenceStub = {
+  name: 'session-persistence-stub',
+  apply(ctx: Context): void {
+    ctx.provide('sessionPersistence', { list: () => Promise.resolve([]) } as never)
+  },
+}
+
+/** The gateway over the minimal spine, provided as ctx.apiProxy (model routing stubbed). */
+const ApiHost = {
+  name: 'api-host',
+  // Mirrors ApiProxyService.inject for the services this composition provides;
+  // 'workspace' is REQUIRED — the gateway's workspace domain calls
+  // ctx.workspace property access, which cordis gates on the inject list.
+  inject: ['sessions', 'userInteraction', 'agents', 'workspace'],
+  apply(ctx: Context, config: { cwd: string }): void {
+    ctx.provide('apiProxy', createApiProxy(ctx, {
+      provider: 'p',
+      model: 'm',
+      cwd: config.cwd,
+      workspaceRoot: config.cwd,
+    }))
+  },
+}
+
+async function bootComposition(): Promise<{ ctx: Context; port: number; root: string }> {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bridge-e2e-'))
+  const dist = join(root, 'dist')
+  mkdirSync(dist)
+  const distIndex = join(dist, 'index.html')
+  await writeFile(distIndex, '<head></head><body>shell</body>')
+  const configPath = join(root, 'cordis.yml')
+  await writeFile(configPath, [
+    "- name: '@deepseek-ai/dsh-host-webserver'",
+    '  config:',
+    "    host: '127.0.0.1'",
+    '    port: 3090',
+    '    portConflict: increment',
+    `    distIndex: '${distIndex}'`,
+    "- name: '@deepseek-ai/dsh-session'",
+    "- name: '@deepseek-ai/dsh-user-interaction'",
+    "- name: '@deepseek-ai/dsh-agent'",
+    "- name: '@deepseek-ai/dsh-system-prompt'",
+    "- name: '@deepseek-ai/dsh-tools'",
+    "- name: '@deepseek-ai/dsh-llm'",
+    "- name: '@deepseek-ai/dsh-agent-loop'",
+    "- name: '@deepseek-ai/dsh-storage'",
+    "- name: '@deepseek-ai/dsh-storage-json'",
+    '  config:',
+    `    root: '${join(root, 'storage')}'`,
+    "- name: '@deepseek-ai/dsh-storage-domain'",
+    '  config:',
+    "    backend: 'json'",
+    "- name: 'test:session-persistence'",
+    "- name: '@deepseek-ai/dsh-workspace'",
+    "- name: 'test:api-host'",
+    '  config:',
+    `    cwd: '${root}'`,
+    `- name: '${BRIDGE}'`,
+    '  config:',
+    `    token: '${TOKEN}'`,
+    `    sessionWorkspacePath: '${join(root, 'browser-sessions')}'`,
+    '',
+  ].join('\n'))
+
+  const context = new Context()
+  context.baseUrl = pathToFileURL(root).href + '/'
+  await context.plugin(Loader)
+  context.loader.builtins.include = Include
+  const modules = new Map<string, unknown>([
+    ['@deepseek-ai/dsh-host-webserver', HttpServer],
+    ['@deepseek-ai/dsh-session', SessionStore],
+    ['@deepseek-ai/dsh-user-interaction', UserInteractionService],
+    ['@deepseek-ai/dsh-agent', AgentRegistry],
+    ['@deepseek-ai/dsh-system-prompt', SystemPrompt],
+    ['@deepseek-ai/dsh-tools', ToolRegistry],
+    ['@deepseek-ai/dsh-llm', LlmService],
+    ['@deepseek-ai/dsh-agent-loop', AgentLoop],
+    ['@deepseek-ai/dsh-storage', Storage],
+    ['@deepseek-ai/dsh-storage-json', StorageJson],
+    ['@deepseek-ai/dsh-storage-domain', StorageDomain],
+    ['test:session-persistence', SessionPersistenceStub],
+    ['@deepseek-ai/dsh-workspace', WorkspaceRegistry],
+    ['test:api-host', ApiHost],
+    [BRIDGE, BridgeBrowser],
+  ])
+  context.loader.internal = {
+    version: 'v2',
+    async import(specifier: string) {
+      if (!modules.has(specifier)) throw new Error(`unexpected Loader import: ${specifier}`)
+      return modules.get(specifier)
+    },
+  } as unknown as NonNullable<typeof context.loader.internal>
+  await context.loader.create({ name: 'cordis:include', config: { path: pathToFileURL(configPath).href } })
+  await context.loader.await()
+  const port = (context.get('httpServer') as { port: number }).port
+  return { ctx: context, port, root }
+}
+
+/** Locate a usable Chromium executable (env override, then the Playwright cache). */
+function chromiumExecutable(): string | undefined {
+  const fromEnv = process.env.PLAYWRIGHT_CHROMIUM_PATH
+  if (fromEnv !== undefined && existsSync(fromEnv)) return fromEnv
+  const home = process.env.HOME ?? ''
+  const cacheRoot = join(home, 'Library', 'Caches', 'ms-playwright')
+  if (!existsSync(cacheRoot)) return undefined
+  for (const dir of ['chromium-1217', 'chromium-1226', 'chromium-1181']) {
+    const mac = join(cacheRoot, dir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing')
+    const macIntel = join(cacheRoot, dir, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium')
+    const linux = join(cacheRoot, dir, 'chrome-linux', 'chrome')
+    for (const candidate of [mac, macIntel, linux]) {
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return undefined
+}
+
+const EXTENSION_DIR = resolve(import.meta.dirname, '../../../../../extensions/dsh-browser/dist')
+
+let context: Context | undefined
+let root: string | undefined
+let port: number | undefined
+let browser: BrowserContext | undefined
+let executable: string | undefined
+
+beforeAll(async () => {
+  executable = chromiumExecutable()
+  if (executable === undefined) return
+  if (!existsSync(join(EXTENSION_DIR, 'manifest.json'))) return
+  const booted = await bootComposition()
+  context = booted.ctx
+  root = booted.root
+  port = booted.port
+  // Extensions require a persistent context; channel 'chromium' selects the
+  // new headless mode, which supports MV3 extensions.
+  browser = await chromium.launchPersistentContext(join(root, 'chrome-profile'), {
+    executablePath: executable,
+    channel: 'chromium',
+    headless: true,
+    args: [
+      `--disable-extensions-except=${EXTENSION_DIR}`,
+      `--load-extension=${EXTENSION_DIR}`,
+    ],
+  })
+})
+
+afterAll(async () => {
+  await browser?.close()
+  await context?.fiber.dispose()
+  if (root !== undefined) await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+})
+
+describe('extension ↔ bridge e2e', () => {
+  it('loads the extension, connects to the real bridge, and shows connected in the panel', { timeout: 120_000 }, async () => {
+    if (executable === undefined) {
+      console.warn('SKIP: no usable Chromium (set PLAYWRIGHT_CHROMIUM_PATH or install playwright chromium)')
+      return
+    }
+    if (browser === undefined || context === undefined) {
+      console.warn('SKIP: extension dist not built (run: pnpm --filter dsh-browser-extension run build)')
+      return
+    }
+
+    const ctx = browser
+    // The service worker may already be registered when launchPersistentContext
+    // returns — waitForEvent would then miss it and time out; check first.
+    let sw = ctx.serviceWorkers()[0]
+    if (sw === undefined) {
+      sw = await ctx.waitForEvent('serviceworker', { timeout: 30_000 })
+    }
+    expect(new URL(sw.url()).host.length).toBeGreaterThan(0)
+
+    const manifest = await sw.evaluate(() => chrome.runtime.getManifest().name)
+    expect(manifest).toBe('dsh 浏览器助手')
+
+    // Clicking the toolbar icon must open the side panel automatically.
+    const behavior = await sw.evaluate(() => chrome.sidePanel.getPanelBehavior())
+    expect(behavior.openPanelOnActionClick).toBe(true)
+
+    const extensionId = new URL(sw.url()).host
+    const panel = await ctx.newPage()
+    await panel.goto(`chrome-extension://${extensionId}/panel/index.html`)
+    await panel.waitForSelector('header', { timeout: 15_000 })
+
+    // Pin the bridge deterministically through the real settings UI (URL +
+    // token). Auto-discovery is environment-dependent — a local dsh may own
+    // port 3081 — so without pinning, the panel could connect to a different
+    // bridge than this composition and the store assertions would be void.
+    // The URL is entered WITHOUT the /ext/bridge path: the extension must
+    // normalize it (regression guard for manual address entry).
+    const sessions = context.get('sessions') as {
+      list(): Array<{ id: string; header: { cwd?: string } }>
+    }
+    const initialSessions = sessions.list()
+    const initialIds = new Set(initialSessions.map(session => session.id))
+
+    await panel.click('text=设置')
+    await panel.fill('input[placeholder*="自动检测"]', `ws://127.0.0.1:${port}`)
+    await panel.fill('input[type="password"]', TOKEN)
+    await panel.click('text=保存并连接')
+
+    // The settings must land in background storage before the reconnect.
+    await panel.waitForFunction((expected) => {
+      return chrome.storage.local.get('dshSettings').then((stored) => {
+        const settings = stored.dshSettings as { bridgeUrl?: string } | undefined
+        return settings?.bridgeUrl === expected
+      })
+    }, `ws://127.0.0.1:${port}`, { timeout: 15_000 })
+
+    // The panel must report "connected" after the token-authenticated
+    // reconnect to this composition. (Intermediate states like 未连接 can be
+    // coalesced into one render frame, so only the end state is asserted.)
+    await panel.waitForFunction(() => {
+      const status = document.querySelector('.status')
+      return status !== null && status.textContent !== null && status.textContent.includes('已连接')
+    }, undefined, { timeout: 30_000 })
+    const statusText = await panel.textContent('.status')
+
+    // Session deferral: opening the panel alone must NOT create a session.
+    // Give the panel's ensureSession + history round trip a moment, then the
+    // store must still equal the pre-save baseline (zero trace).
+    await panel.waitForSelector('.page-chip', { timeout: 30_000 })
+    await panel.waitForTimeout(1_200)
+    expect(sessions.list().length).toBe(initialSessions.length)
+
+    // The first message materializes the session through the real bridge.
+    await panel.fill('textarea', '你好')
+    await panel.press('textarea', 'Enter')
+    await expect.poll(() => sessions.list().length, { timeout: 30_000 }).toBeGreaterThan(initialSessions.length)
+
+    const createdSession = sessions.list().find(session => !initialIds.has(session.id))
+    const workspace = (context.get('workspace') as WorkspaceRegistry).list()[0]
+    expect(workspace?.path).toBe(await realpath(join(root as string, 'browser-sessions')))
+    expect(workspace?.sessionIds).toContain(createdSession?.id)
+    expect(createdSession?.header.cwd).toBe(workspace?.path)
+
+    expect(statusText).toContain('已连接')
+
+  }, 120_000)
+})
