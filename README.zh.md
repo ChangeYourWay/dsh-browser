@@ -24,9 +24,10 @@
 ## 组成
 
 ```
-packages/browser/bridge-browser/   桥插件：token 认证 WS 通道 + browser_* 工具 + 线协议
-extensions/dsh-browser/            Chrome MV3 扩展：content script 在真实页面执行动作 + 侧边栏对话界面
-examples/browser-bridge.cordis.yml overlay 示例
+packages/browser/bridge-browser/    桥插件：token 认证 WS 通道 + browser_* 工具 + 线协议
+extensions/dsh-browser/             Chrome MV3 扩展：content script 在真实页面执行动作 + 侧边栏对话界面
+examples/browser-bridge.cordis.yml  dsh web overlay 示例（--config 引入）
+scripts/install.sh                  一键安装脚本
 ```
 
 ## 为什么这样设计
@@ -38,44 +39,45 @@ examples/browser-bridge.cordis.yml overlay 示例
 
 ## 安装与使用（零配置）
 
-**第一步：启动 dsh**（在宿主 SDK checkout 下，本仓库是其中的 `dsh-browser/` 子目录）：
+前提：`dsh` 已安装并可用；本仓库位于宿主 SDK checkout 的 `dsh-browser/` 子目录。
+
+**第一步：启动 dsh**（在本仓库根目录下执行；`--config` 路径相对当前目录）：
 
 ```sh
-# 让 `dsh` 命令指向包含本插件的宿主 checkout（launcher 读 ~/.dsh/source/current）
-ln -sfn <宿主 checkout> ~/.dsh/source/current
-
-# 启动（3080 若已被其他 dsh web 占用，换一个端口）
-cd <宿主 checkout>/dsh-browser
-dsh web --config examples/browser-bridge.cordis.yml --port 3081
+dsh web --config examples/browser-bridge.cordis.yml
 ```
+
+默认端口 3080；被其他 `dsh web` 占用时，追加 `--port <端口>` 换一个。
 
 **第二步：安装扩展（一条命令）**：
 
 ```sh
-./dsh-browser/scripts/install.sh
+./scripts/install.sh
 ```
 
 脚本会构建插件与扩展、复制到 `~/.dsh/browser-extension`、打开 `chrome://extensions`；按提示开启开发者模式并加载该目录即可。工具栏出现 DeepSeek 鲸鱼图标，点击打开侧边栏。
 
 **无需任何配置**：扩展自动探测本机 dsh 并连接（`/ext/bridge-config` 发现 + 回环免 token）。token/地址只在远程部署（`--host 0.0.0.0`）时才需要手动填写。
 
-## 构建顺序与宿主前提
+## 开发
 
-- 插件包需在宿主使用前构建：`pnpm --filter @deepseek-ai/dsh-bridge-browser run build`（或在 `dsh-browser/packages/browser/bridge-browser` 下 `pnpm run build`），产出 `lib/` 供 Loader 加载。
-- 宿主 checkout 的可用性以 `dsh-browser/` 存在为前提（`apps/cli` 通过 `workspace:^` 引用插件包）；不需要插件时删除/移走 `dsh-browser/` 并移除符号链接即可。
-
-## 开发模型
-
-插件包在**宿主 SDK workspace** 内开发测试（peer 依赖模型）：宿主 `pnpm-workspace.yaml` 通过 `packages/browser/bridge-browser` 符号链接把本仓库的插件包挂载为成员（符号链接悬空时宿主不受影响）。扩展是完全独立的 Vite 项目，在自身 workspace 内安装。
+插件包是宿主 SDK workspace 的成员（宿主 `pnpm-workspace.yaml` 经 `packages/browser/bridge-browser` 符号链接挂载，peer 依赖由宿主提供），插件包命令须在**宿主 checkout 根目录**（即本仓库的上一级 `..`）下执行；Chrome 扩展完全独立，命令在**本仓库根目录**下执行。
 
 ```sh
-# 插件包（经宿主 workspace）
+# 插件包：在宿主 checkout 根目录执行（依赖随宿主 workspace 安装）
+pnpm --filter @deepseek-ai/dsh-bridge-browser run build       # tsc -b + tsdown，产出 lib/
 pnpm --filter @deepseek-ai/dsh-bridge-browser run typecheck   # tsc -b（extends 宿主 tsconfig.base）
 pnpm --filter @deepseek-ai/dsh-bridge-browser run test        # vitest（paths 指向宿主源码）
 
-# 扩展（自身 workspace）
-cd extensions/dsh-browser && pnpm install && pnpm run test && pnpm run build
+# 扩展：在本仓库根目录执行（首次克隆先 pnpm install）
+pnpm --filter dsh-browser-extension run build
+pnpm --filter dsh-browser-extension run test
 ```
+
+注意：
+
+- 宿主使用前插件包必须先构建（`lib/` 供 Loader 加载）；`scripts/install.sh` 已代为执行，日常使用无需手动构建。
+- 宿主 checkout 以 `dsh-browser/` 存在为前提（符号链接悬空时宿主不受影响）；不需要插件时移走 `dsh-browser/` 并移除该符号链接即可。
 
 ## 安全
 
