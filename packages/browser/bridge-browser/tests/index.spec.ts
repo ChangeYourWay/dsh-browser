@@ -3,18 +3,26 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { apply, assertPositiveInteger, Config, resolveConfig } from '../src/index.ts'
 
 /** Minimal context stub: apply only needs the services at registration time. */
 function stubContext(): Context {
+  const gateway = {
+    wireStream: {
+      open: async (): Promise<AsyncIterable<unknown>> => ({ async *[Symbol.asyncIterator]() {} }),
+      failure: (error: unknown) => ({ code: 'internal', message: String(error), details: {} }),
+    },
+    invoke: async () => undefined,
+  }
+  const connection = {
+    createSharedFetchHandler: () => ({ fetch: async () => new Response('not found', { status: 404 }) }),
+  }
   return {
-    apiProxy: { sessions: {} } as ApiProxy,
     webServer: { port: 0, registerUpgrade: () => () => {}, register: () => () => {} },
     tools: { register: () => () => {} },
     agents: { get: () => undefined },
-    get: () => undefined,
+    get: (key: string) => key === 'typertGateway' ? gateway : key === 'connection' ? connection : undefined,
     on: () => () => {},
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     effect: (fn: () => unknown, label?: string) => {

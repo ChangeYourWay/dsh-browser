@@ -1,16 +1,15 @@
 /**
  * Bridge WebSocket carrier: token-authenticated connection registry, gateway
- * RPC passthrough, per-connection event pump, and tool-call dispatch to the
+ * RPC dispatch, per-connection event pump, and tool-call dispatch to the
  * connected browser extension.
  *
  * The route this server mounts (`/ext/bridge`) lives OUTSIDE the /api trust
  * fence (which only guards the client-connection routes), so the bridge brings
  * its own authentication: a bearer token presented in the `hello` frame within
- * HELLO_TIMEOUT_MS. Gateway RPCs are dispatched through the same fetch-shaped
- * handler the /api carrier uses (`toFetchHandler`), so schema validation and
- * error envelopes are identical to the GUI path. Methods the /api carrier
- * pins to loopback (`PRIVILEGED_METHODS`) stay loopback-only here regardless
- * of the token, defense in depth for `--host 0.0.0.0` deployments.
+ * HELLO_TIMEOUT_MS. Host calls terminate at the bridge-owned dsh 0.1.2 Remote
+ * adapter. Methods the /api carrier pins to loopback (`PRIVILEGED_METHODS`)
+ * stay loopback-only here regardless of the token, defense in depth for
+ * `--host 0.0.0.0` deployments.
  *
  * One active connection at a time: a new authenticated socket replaces the
  * previous one (the old socket is closed and its in-flight tool calls settle
@@ -23,7 +22,7 @@ import { randomUUID } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { BrowserHostApi } from './host-api.ts'
 import {
   BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD,
   BRIDGE_SESSION_PURGE_METHOD,
@@ -84,10 +83,8 @@ export class BridgeToolError extends Error {
 export interface BridgeServerDeps {
   /** Bearer token the extension must present in `hello`. */
   token: string
-  /** Fetch-shaped gateway carrier (from `toFetchHandler(ctx.apiProxy)`). */
-  apiHandler: { fetch: (request: Request) => Promise<Response> }
-  /** Per-connection event stream (usually `ctx.apiProxy.events.mux`). */
-  openEvents: (signal: AbortSignal) => AsyncIterable<RpcRequest<MuxFrame>>
+  /** dsh 0.1.2 Remote adapter used for unary calls, events, and waterfalls. */
+  api: BrowserHostApi
   /** Default per-tool-call timeout in ms. */
   toolTimeoutMs: number
   /** Capabilities to echo in `hello.ok` (negotiated snapshot budgets). */
@@ -334,16 +331,20 @@ export class BridgeServer {
     const ping = setInterval(() => { sendFrame(ws, { t: 'ping' }) }, this.deps.pingIntervalMs ?? PING_INTERVAL_MS)
     const pump = (async () => {
       try {
-        for await (const envelope of this.deps.openEvents(abort.signal)) {
+        for await (const frame of this.deps.api.events(abort.signal)) {
           if (ws.readyState !== WebSocket.OPEN) break
           sendFrame(ws, {
             t: 'event',
-            frame: { rpcId: envelope.rpcId, method: envelope.payload.type, payload: envelope.payload },
+            frame,
           })
         }
       } catch (error: unknown) {
         if (!abort.signal.aborted && ws.readyState === WebSocket.OPEN) {
           sendFrame(ws, { t: 'error', code: 'stream-failed', message: String(error) })
+          // An authenticated socket without its Remote streams is unusable but
+          // otherwise appears healthy to the extension. Closing the generation
+          // activates its bounded reconnect loop and rebuilds every follower.
+          ws.close(1011, 'event stream failed')
         }
       }
     })()
@@ -460,54 +461,31 @@ export class BridgeServer {
       }
       return
     }
-    const body = JSON.stringify({ type: 'client-request', rpcId: frame.id, method: frame.method, payload: frame.payload })
-    const request = new Request(new URL(`/api/${frame.method}`, 'http://dsh.internal'), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body,
-    })
     try {
-      const response = await this.deps.apiHandler.fetch(request)
-      const text = await response.text()
-      if (!response.ok) {
-        sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: false, error: { code: 'http', message: text } })
-        return
-      }
-      let result: unknown
-      try {
-        result = JSON.parse(text)
-      } catch {
-        result = text
-      }
-      sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: true, result })
+      const result = await this.deps.api.call({
+        rpcId: frame.id,
+        method: frame.method,
+        payload: frame.payload,
+        signal: conn.abort.signal,
+      })
+      sendFrame(conn.ws, {
+        t: 'rpc.result',
+        id: frame.id,
+        ok: true,
+        result: { type: 'server-response', rpcId: frame.id, result },
+      })
     } catch (error: unknown) {
       sendFrame(conn.ws, { t: 'rpc.result', id: frame.id, ok: false, error: { code: 'internal', message: String(error) } })
     }
   }
 
-  /** Relay a pending host-interaction response through the GUI's /api/respond channel. */
+  /** Relay a pending Host waterfall response through the dsh 0.1.2 adapter. */
   private async handleRespond(frame: Extract<ClientFrame, { t: 'respond' }>): Promise<void> {
     const conn = this.current
     /* v8 ignore next -- replacement race; a closed socket simply drops the receipt */
     if (conn === null) return
-    const request = new Request(new URL('/api/respond', 'http://dsh.internal'), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-response', rpcId: frame.rpcId, result: frame.result }),
-    })
     try {
-      const response = await this.deps.apiHandler.fetch(request)
-      const text = await response.text()
-      if (!response.ok) {
-        sendFrame(conn.ws, { t: 'respond.result', id: frame.id, ok: false, error: { code: 'http', message: text } })
-        return
-      }
-      let result: unknown
-      try {
-        result = JSON.parse(text)
-      } catch {
-        result = text
-      }
+      const result = await this.deps.api.respond(frame.rpcId, frame.result, conn.abort.signal)
       sendFrame(conn.ws, { t: 'respond.result', id: frame.id, ok: true, result })
     } catch (error: unknown) {
       sendFrame(conn.ws, { t: 'respond.result', id: frame.id, ok: false, error: { code: 'internal', message: String(error) } })

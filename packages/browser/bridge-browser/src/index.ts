@@ -4,11 +4,11 @@
  *
  * The bridge mounts its own upgrade route (`/ext/bridge`) on the host
  * webserver, OUTSIDE the /api trust fence — so it brings its own bearer-token
- * authentication (first frame `hello` within HELLO_TIMEOUT_MS). Gateway RPCs
- * from the extension are dispatched through the same fetch-shaped handler the
- * /api carrier uses, and session events are pumped per connection. Tools
- * execute by dispatching `tool.call` frames to the connected extension, which
- * performs the action in the tab explicitly controlled by the user.
+ * authentication (first frame `hello` within HELLO_TIMEOUT_MS). Extension
+ * calls, Session streams, and Host waterfalls are projected onto dsh 0.1.2's
+ * Typert Gateway and Connection services. Tools execute by dispatching
+ * `tool.call` frames to the connected extension, which performs the action in
+ * the tab explicitly controlled by the user.
  *
  * Opt-in by design: nothing is registered unless this plugin appears in the
  * composition. No dsh core code is touched.
@@ -22,11 +22,7 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-host-apiproxy'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { BridgeServer } from './server.ts'
 import { BrowserContextInjector } from './browser-context.ts'
@@ -41,12 +37,18 @@ import { withSessionDeferral } from './session-deferral.ts'
 import { withSessionWorkspace } from './session-workspace.ts'
 import { purgeSessionFiles, type SessionPurgeDeps } from './session-purge.ts'
 import { resolveToken } from './token.ts'
+import {
+  createRemoteHostApi,
+  type HostConnectionLike,
+  type TypertGatewayLike,
+} from './remote-host-api.ts'
+import { isRecord } from './host-api.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'bridge-browser'
 
 /** Services required by this plugin. */
-export const inject = ['webServer', 'apiProxy', 'tools', 'agents']
+export const inject = ['webServer', 'typertGateway', 'connection', 'tools', 'agents']
 
 /** Default per-tool-call budget (ms). */
 const DEFAULT_TOOL_TIMEOUT_MS = 90_000
@@ -132,11 +134,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const resolved = resolveConfig(config)
 
   const tokenRes = await resolveToken(resolved.token)
+  const gateway = ctx.get('typertGateway') as unknown as TypertGatewayLike | undefined
+  const connection = ctx.get('connection') as unknown as HostConnectionLike | undefined
+  if (gateway === undefined || connection === undefined) {
+    throw new Error('bridge-browser: dsh 0.1.2 typertGateway and connection services are required')
+  }
   // Workspace grouping wraps the gateway create; session deferral wraps the
   // result so materialization at first prompt still flows through grouping.
-  const api: ApiProxy = withSessionDeferral(
+  const api = withSessionDeferral(
     withSessionWorkspace(
-      ctx.apiProxy,
+      createRemoteHostApi(gateway, connection),
       resolved.sessionWorkspacePath,
       message => { ctx.logger.warn(message) },
     ),
@@ -149,10 +156,17 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const purgeSession = async (sessionId: string): Promise<void> => {
     const runningSessionIds = new Set<string>()
     try {
-      const listed = await api.sessions.list({ rpcId: RpcId(randomUUID()), payload: {} })
-      if (listed.result.ok) {
-        for (const entry of listed.result.value.items) {
-          if (entry.running) runningSessionIds.add(entry.sessionId)
+      const listed = await api.call({
+        rpcId: randomUUID(),
+        method: 'session.list',
+        payload: {},
+        signal: new AbortController().signal,
+      })
+      if (listed.ok && isRecord(listed.value) && Array.isArray(listed.value.items)) {
+        for (const entry of listed.value.items) {
+          if (isRecord(entry) && entry.running === true && typeof entry.sessionId === 'string') {
+            runningSessionIds.add(entry.sessionId)
+          }
         }
       }
     } catch {
@@ -165,8 +179,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const server = new BridgeServer({
     token: tokenRes.token,
-    apiHandler: toFetchHandler(api),
-    openEvents: (signal) => api.events.mux({ rpcId: RpcId(randomUUID()), payload: {} }, signal),
+    api,
     toolTimeoutMs: resolved.toolTimeoutMs,
     caps: {
       textOnly: true,
