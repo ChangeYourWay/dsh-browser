@@ -667,7 +667,7 @@ function historyValue(snapshot: SessionSnapshot): Record<string, unknown> {
 
 function historyPageValue(page: unknown): Record<string, unknown> {
   if (!isRecord(page) || !Array.isArray(page.records) || typeof page.hasMore !== 'boolean') {
-    return { events: [], hasMore: false }
+    throw new TypeError('session/page returned an invalid history page')
   }
   return historyValue({
     cursor: -1,
