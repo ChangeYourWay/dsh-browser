@@ -82,7 +82,7 @@ const ApiHost = {
               sessionId: session.id,
               cwd: session.header.cwd,
               running: false,
-              blank: session.events.length === 0,
+              blank: session.seq === 0,
               updatedAt: session.header.createdAt,
             })),
           }
