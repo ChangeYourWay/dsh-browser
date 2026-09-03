@@ -134,7 +134,7 @@ cd ~/.dsh/dsh-browser && pnpm start
 From a source checkout, run `pnpm start` in the repository root. Once it is published, the exact supported public runtime is:
 
 ```sh
-npx @deepseek-ai/dsh@0.1.2 web
+npx @deepseek-ai/dsh@0.1.2-rc.1 web
 ```
 
 Local Chrome use requires no configuration; Firefox requires the local bridge token described above. Open an `http://` or `https://` page, click the DeepSeek whale icon, and wait for **Connected**. Existing tabs are instrumented on the first action; protected browser pages and extension stores are not supported.

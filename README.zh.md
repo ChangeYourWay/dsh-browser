@@ -134,7 +134,7 @@ cd ~/.dsh/dsh-browser && pnpm start
 使用源码 checkout 时，请在仓库根目录运行 `pnpm start`。待正式发布后，受支持的精确公开版本为：
 
 ```sh
-npx @deepseek-ai/dsh@0.1.2 web
+npx @deepseek-ai/dsh@0.1.2-rc.1 web
 ```
 
 Chrome 本机使用无需配置；Firefox 需要填写上述本地桥 token。打开任意 `http://` 或 `https://` 页面，点击 DeepSeek 鲸鱼图标，等待侧边栏显示**已连接**。已有标签页会在第一次操作时自动加载；浏览器受保护页面和扩展商店不受支持。
