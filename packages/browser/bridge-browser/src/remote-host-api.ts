@@ -62,7 +62,7 @@ interface PendingQuestion {
   settled: boolean
 }
 
-/** Build the sole Host implementation supported by this bridge. */
+/** Build the dsh 0.1.2 Host implementation. */
 export function createRemoteHostApi(
   gateway: TypertGatewayLike,
   connection: HostConnectionLike,

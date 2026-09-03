@@ -74,9 +74,9 @@ export interface BridgeCaps {
 export type ClientFrame =
   /** First frame, within HELLO_TIMEOUT_MS of socket open. */
   | { t: 'hello'; token: string; caps: BridgeCaps }
-  /** Unary bridge Host call (the Host adapter projects these onto dsh 0.1.2 Remotes). */
+  /** Unary call projected by the active dsh Host adapter. */
   | { t: 'rpc'; id: string; method: string; payload: unknown }
-  /** Answer or cancel a pending dsh 0.1.2 Remote Event waterfall. */
+  /** Answer or cancel a pending Host interaction waterfall. */
   | { t: 'respond'; id: string; rpcId: string; result: RespondResult }
   /** Result of a previously dispatched tool call. */
   | { t: 'tool.result'; id: string; ok: true; result: unknown }

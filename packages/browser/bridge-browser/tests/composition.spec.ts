@@ -52,10 +52,16 @@ const ApiHost = {
   name: 'api-host',
   inject: ['sessions'],
   apply(ctx: Context, config: { cwd: string }): void {
+    let remoteEventsReady = false
     const gateway = {
       wireStream: {
         async open(endpoint: string, _payload: unknown, signal: AbortSignal): Promise<AsyncIterable<unknown>> {
           if (endpoint === '$events') {
+            if (!remoteEventsReady) {
+              throw Object.assign(new Error('forwarded Remote event source is unavailable'), {
+                code: 'gateway/service-unavailable',
+              })
+            }
             return {
               async *[Symbol.asyncIterator]() {
                 yield { type: 'ready', clientId: 'composition-client', host: { home: root } }
@@ -65,7 +71,17 @@ const ApiHost = {
           }
           throw new Error(`unexpected composition stream ${endpoint}`)
         },
-        failure: (error: unknown) => ({ code: 'internal', message: String(error), details: {} }),
+        failure: (error: unknown) => ({
+          code: typeof (error as { code?: unknown }).code === 'string'
+            ? (error as { code: string }).code
+            : 'internal',
+          message: String(error),
+          details: {},
+        }),
+      },
+      registerRemoteEvents: () => {
+        remoteEventsReady = true
+        return async () => { remoteEventsReady = false }
       },
       async invoke(request: { namespace: string; method: string; args: Record<string, unknown> }) {
         if (request.namespace === 'session' && request.method === 'create') {

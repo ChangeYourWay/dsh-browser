@@ -6,8 +6,8 @@
  * The route this server mounts (`/ext/bridge`) lives OUTSIDE the /api trust
  * fence (which only guards the client-connection routes), so the bridge brings
  * its own authentication: a bearer token presented in the `hello` frame within
- * HELLO_TIMEOUT_MS. Host calls terminate at the bridge-owned dsh 0.1.2 Remote
- * adapter. Methods the /api carrier pins to loopback (`PRIVILEGED_METHODS`)
+ * HELLO_TIMEOUT_MS. Host calls terminate at the bridge-owned Host adapter.
+ * Methods the /api carrier pins to loopback (`PRIVILEGED_METHODS`)
  * stay loopback-only here regardless of the token, defense in depth for
  * `--host 0.0.0.0` deployments.
  *
@@ -83,7 +83,7 @@ export class BridgeToolError extends Error {
 export interface BridgeServerDeps {
   /** Bearer token the extension must present in `hello`. */
   token: string
-  /** dsh 0.1.2 Remote adapter used for unary calls, events, and waterfalls. */
+  /** Active dsh Host adapter used for unary calls, events, and waterfalls. */
   api: BrowserHostApi
   /** Default per-tool-call timeout in ms. */
   toolTimeoutMs: number
@@ -479,7 +479,7 @@ export class BridgeServer {
     }
   }
 
-  /** Relay a pending Host waterfall response through the dsh 0.1.2 adapter. */
+  /** Relay a pending Host waterfall response through the active adapter. */
   private async handleRespond(frame: Extract<ClientFrame, { t: 'respond' }>): Promise<void> {
     const conn = this.current
     /* v8 ignore next -- replacement race; a closed socket simply drops the receipt */
