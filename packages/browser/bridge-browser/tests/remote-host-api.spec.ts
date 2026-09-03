@@ -105,6 +105,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
             async *[Symbol.asyncIterator]() {
               yield {
                 type: 'snapshot',
+                cursor: 3,
                 records: [
                   { type: 'event', event: { type: 'user/message', seq: 0, time: 1, data: {} } },
                   {
@@ -179,6 +180,55 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     await events.return?.()
   })
 
+  it('pages older history with a Host-legal throughSeq, never MAX_SAFE_INTEGER', async () => {
+    const { api, invoke, open } = harness({
+      invoke: async ({ namespace, method, args }) => {
+        if (`${namespace}/${method}` !== 'session/page') throw new Error(`${namespace}/${method}`)
+        expect(args).toEqual({
+          request: {
+            address: { kind: 'session', sessionId: 'session-1' },
+            throughSeq: 42,
+            beforeSeq: 10,
+            maxMessages: 20,
+          },
+        })
+        return {
+          records: [{ type: 'event', event: { type: 'user/message', seq: 9, time: 1, data: {} } }],
+          hasMore: true,
+        }
+      },
+      open: async (endpoint) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: 42, records: [], hasMore: false }
+            },
+          }
+        }
+        throw new Error(endpoint)
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: 10,
+      maxMessages: 20,
+    }))).resolves.toEqual({
+      ok: true,
+      value: {
+        events: [{ event: { type: 'user/message', seq: 9, time: 1, data: {} } }],
+        hasMore: true,
+      },
+    })
+    expect(open).toHaveBeenCalledWith('session/follow', {
+      args: { request: { address: { kind: 'session', sessionId: 'session-1' } } },
+    }, expect.any(AbortSignal))
+    expect(invoke).toHaveBeenCalledOnce()
+    const pageArgs = invoke.mock.calls[0]?.[0]?.args as { request: { throughSeq: number } }
+    expect(pageArgs.request.throughSeq).toBe(42)
+    expect(pageArgs.request.throughSeq).not.toBe(Number.MAX_SAFE_INTEGER)
+  })
+
   it('reads workspace.list from the workspace/follow baseline', async () => {
     const { api, open } = harness({
       open: async (endpoint) => ({
@@ -204,7 +254,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
         if (endpoint === 'session/follow') {
           return {
             async *[Symbol.asyncIterator]() {
-              yield { type: 'snapshot', records: [], hasMore: false }
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
               await abortWait(signal)
             },
           }
@@ -325,7 +375,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
         if (endpoint === 'session/follow') {
           return {
             async *[Symbol.asyncIterator]() {
-              yield { type: 'snapshot', records: [], hasMore: false }
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
               await abortWait(signal)
             },
           }
