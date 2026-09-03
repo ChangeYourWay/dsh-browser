@@ -548,3 +548,76 @@ describe('dispatchToolCall', () => {
     expect(chromeMock.getAllFrames).toHaveBeenCalledTimes(3)
   })
 })
+
+describe('dispatchOpenTab', () => {
+  it('creates a tab, rebinds, and snapshots after content ready', async () => {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const runtimeListeners = new Set<(message: unknown, sender: chrome.runtime.MessageSender) => void>()
+    const create = vi.fn(async () => ({ id: 42, windowId: 9, url: 'https://docs.example/' }))
+    const sendMessage = vi.fn(async () => ({ ok: true, result: { text: 'new page' } }))
+    const getAllFrames = vi.fn(async () => [{
+      frameId: 0, parentFrameId: -1, documentId: 'doc-42', url: 'https://docs.example/',
+    }])
+    vi.stubGlobal('chrome', {
+      tabs: { create, sendMessage, query: vi.fn(async () => []) },
+      scripting: { executeScript: vi.fn(async () => [{ frameId: 0, result: undefined }]) },
+      webNavigation: { getAllFrames },
+      runtime: {
+        onMessage: {
+          addListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.add(listener)
+          },
+          removeListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.delete(listener)
+          },
+        },
+      },
+    })
+
+    const bindCreatedTab = vi.fn(() => true)
+    const open = dispatchOpenTab(
+      { id: 'open-1', name: 'browser_open_tab', args: { url: 'https://docs.example/' } },
+      9,
+      'auto',
+      { maxItems: 60, maxChars: 12_000 },
+      async () => 'approved',
+      undefined,
+      bindCreatedTab,
+      () => true,
+    )
+    await vi.waitFor(() => { expect(runtimeListeners.size).toBe(1) })
+    for (const listener of runtimeListeners) {
+      listener(
+        { type: 'DSH_CONTENT_READY' },
+        { tab: { id: 42 }, frameId: 0, documentId: 'doc-42' } as chrome.runtime.MessageSender,
+      )
+    }
+    const answer = await open
+    expect(create).toHaveBeenCalledWith({ url: 'https://docs.example/', active: true, windowId: 9 })
+    expect(bindCreatedTab).toHaveBeenCalledOnce()
+    expect(answer.ok).toBe(true)
+    expect((answer.result as { text: string }).text).toContain('Opened a new tab')
+    expect((answer.result as { text: string }).text).toContain('new page')
+  })
+
+  it('rejects non-http URLs before creating a tab', async () => {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const create = vi.fn()
+    vi.stubGlobal('chrome', { tabs: { create } })
+    const answer = await dispatchOpenTab(
+      { id: 'open-bad', name: 'browser_open_tab', args: { url: 'javascript:alert(1)' } },
+      1,
+      'auto',
+      undefined,
+      async () => 'approved',
+      undefined,
+      () => true,
+      () => true,
+    )
+    expect(answer).toEqual({
+      ok: false,
+      error: { code: 'action-failed', message: 'url must be a complete http or https URL.' },
+    })
+    expect(create).not.toHaveBeenCalled()
+  })
+})

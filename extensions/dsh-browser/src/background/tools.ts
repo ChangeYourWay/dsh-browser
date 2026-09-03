@@ -392,6 +392,9 @@ export async function dispatchToolCall(
   targetTab?: Pick<chrome.tabs.Tab, 'id' | 'url'>,
   targetStillAllowed?: () => boolean,
 ): Promise<ToolAnswer> {
+  if (call.name === 'browser_open_tab') {
+    return unavailable('browser_open_tab must be dispatched through the background open-tab path.')
+  }
   if (isCancelled(call, signal)) return cancelled()
   // Privacy boundary: with sharing off, no page content may leave the page.
   if (sharePageContent === 'off' && (call.name === 'browser_snapshot' || call.name === 'browser_get_text')) {
@@ -520,3 +523,101 @@ function sameTargetDocument(call: ToolCall, before: TabFrame[], after: TabFrame[
     && afterFrame !== undefined
     && frameDocumentKey(beforeFrame) === frameDocumentKey(afterFrame)
 }
+
+/** Parse a model-supplied http(s) URL for tab creation / navigation. */
+export function parseHttpUrl(value: unknown): URL | undefined {
+  if (typeof value !== 'string' || value.trim() === '') return undefined
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Open a URL in a new tab, then optionally snapshot it once the document is ready.
+ * Affinity rebinding is owned by the caller via `bindCreatedTab`.
+ */
+export async function dispatchOpenTab(
+  call: ToolCall,
+  windowId: number,
+  sharePageContent: 'ask' | 'auto' | 'off',
+  budget: ContentBudget | undefined,
+  authorize: ((prompt: ApprovalPrompt) => Promise<ApprovalAuthorization>) | undefined,
+  signal: AbortSignal | undefined,
+  bindCreatedTab: (tab: chrome.tabs.Tab) => boolean,
+  targetStillAllowed: (tabId: number) => boolean,
+): Promise<ToolAnswer> {
+  if (isCancelled(call, signal)) return cancelled()
+  const parsed = parseHttpUrl(call.args.url)
+  if (parsed === undefined) {
+    return { ok: false, error: { code: 'action-failed', message: 'url must be a complete http or https URL.' } }
+  }
+
+  const approval = approvalPromptForCall(call, sharePageContent, [])
+  if (approval !== undefined) {
+    const authorization = authorize === undefined ? 'unavailable' : await authorize(approval)
+    if (isCancelled(call, signal)) return cancelled()
+    if (authorization !== 'approved') return approvalFailure(approval, authorization)
+  }
+
+  let created: chrome.tabs.Tab
+  try {
+    created = await chrome.tabs.create({ url: parsed.href, active: true, windowId })
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      error: {
+        code: 'action-failed',
+        message: error instanceof Error ? error.message : 'Failed to open a new browser tab.',
+      },
+    }
+  }
+  if (created.id === undefined) {
+    return { ok: false, error: { code: 'action-failed', message: 'Chrome created a tab without an id.' } }
+  }
+  if (isCancelled(call, signal)) return cancelled()
+  if (!bindCreatedTab(created)) {
+    return {
+      ok: false,
+      error: { code: 'action-failed', message: 'The new tab could not become the controlled browser target.' },
+    }
+  }
+
+  resetTabSnapshot(created.id)
+  const navigationWait = waitForNextDocumentReady(created.id, 0, undefined, signal)
+  const ready = await navigationWait.ready
+  if (isCancelled(call, signal)) return cancelled()
+  if (!targetStillAllowed(created.id)) return targetChanged()
+
+  const status = `Opened a new tab at ${parsed.href}.`
+  if (!ready || sharePageContent === 'off') {
+    return {
+      ok: true,
+      result: {
+        text: sharePageContent === 'off'
+          ? `${status} Page content sharing is disabled, so no snapshot was captured.`
+          : `${status} Call browser_snapshot again after the page loads.`,
+      },
+    }
+  }
+
+  try {
+    const snapshot = await snapshotAfterNavigation(
+      created.id,
+      call,
+      status,
+      budget ?? { maxItems: 60, maxChars: DEFAULT_SNAPSHOT_MAX_CHARS },
+      () => targetStillAllowed(created.id!),
+    )
+    if (snapshot !== undefined) return snapshot
+  } catch {
+    // Keep the successful open when the replacement page is not yet readable.
+  }
+  return {
+    ok: true,
+    result: { text: `${status} Call browser_snapshot again after the page loads.` },
+  }
+}
+
