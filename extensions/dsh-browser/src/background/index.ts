@@ -919,7 +919,9 @@ function routeToolCall(call: ToolCall): void {
         ))
   ).then(
     (answer) => {
-      if (controller.signal.aborted) {
+      // A committed browser_open_tab already rebound affinity; prefer that
+      // factual success over a generic cancel that would leave the model wrong.
+      if (controller.signal.aborted && !(call.name === 'browser_open_tab' && answer.ok)) {
         if (activeToolCalls.get(call.id) === controller) {
           bridge?.send({
             t: 'tool.result',

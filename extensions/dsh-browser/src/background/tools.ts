@@ -535,9 +535,22 @@ export function parseHttpUrl(value: unknown): URL | undefined {
   }
 }
 
+async function removeCreatedTab(tabId: number): Promise<void> {
+  try {
+    await chrome.tabs.remove(tabId)
+  } catch {
+    // The tab may already have been closed by the user or another tool.
+  }
+}
+
 /**
  * Open a URL in a new tab, then optionally snapshot it once the document is ready.
  * Affinity rebinding is owned by the caller via `bindCreatedTab`.
+ *
+ * Creates a blank tab first, arms the readiness listener, then navigates so a
+ * fast `document_idle` cannot announce readiness before the listener exists.
+ * Cancellation before affinity bind rolls the orphan tab back; after bind the
+ * open is treated as committed and reported as success even if the call expires.
  */
 export async function dispatchOpenTab(
   call: ToolCall,
@@ -564,7 +577,8 @@ export async function dispatchOpenTab(
 
   let created: chrome.tabs.Tab
   try {
-    created = await chrome.tabs.create({ url: parsed.href, active: true, windowId })
+    // No URL yet: register the readiness wait before the http(s) navigation.
+    created = await chrome.tabs.create({ active: true, windowId })
   } catch (error: unknown) {
     return {
       ok: false,
@@ -577,22 +591,46 @@ export async function dispatchOpenTab(
   if (created.id === undefined) {
     return { ok: false, error: { code: 'action-failed', message: 'Chrome created a tab without an id.' } }
   }
-  if (isCancelled(call, signal)) return cancelled()
-  if (!bindCreatedTab(created)) {
+  const tabId = created.id
+  if (isCancelled(call, signal)) {
+    await removeCreatedTab(tabId)
+    return cancelled()
+  }
+
+  const navigationWait = waitForNextDocumentReady(tabId, 0, undefined, signal)
+  try {
+    created = await chrome.tabs.update(tabId, { url: parsed.href })
+  } catch (error: unknown) {
+    navigationWait.cancel()
+    await removeCreatedTab(tabId)
+    return {
+      ok: false,
+      error: {
+        code: 'action-failed',
+        message: error instanceof Error ? error.message : 'Failed to navigate the new browser tab.',
+      },
+    }
+  }
+
+  const ready = await navigationWait.ready
+  if (isCancelled(call, signal)) {
+    await removeCreatedTab(tabId)
+    return cancelled()
+  }
+  if (!bindCreatedTab(created.id === undefined ? { ...created, id: tabId } : created)) {
+    await removeCreatedTab(tabId)
     return {
       ok: false,
       error: { code: 'action-failed', message: 'The new tab could not become the controlled browser target.' },
     }
   }
 
-  resetTabSnapshot(created.id)
-  const navigationWait = waitForNextDocumentReady(created.id, 0, undefined, signal)
-  const ready = await navigationWait.ready
-  if (isCancelled(call, signal)) return cancelled()
-  if (!targetStillAllowed(created.id)) return targetChanged()
+  // Affinity is committed: further cancellation must not claim the tab was never opened.
+  resetTabSnapshot(tabId)
+  if (!targetStillAllowed(tabId)) return targetChanged()
 
   const status = `Opened a new tab at ${parsed.href}.`
-  if (!ready || sharePageContent === 'off') {
+  if (!ready || sharePageContent === 'off' || isCancelled(call, signal)) {
     return {
       ok: true,
       result: {
@@ -605,11 +643,11 @@ export async function dispatchOpenTab(
 
   try {
     const snapshot = await snapshotAfterNavigation(
-      created.id,
+      tabId,
       call,
       status,
       budget ?? { maxItems: 60, maxChars: DEFAULT_SNAPSHOT_MAX_CHARS },
-      () => targetStillAllowed(created.id!),
+      () => targetStillAllowed(tabId),
     )
     if (snapshot !== undefined) return snapshot
   } catch {
