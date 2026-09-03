@@ -201,6 +201,14 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     let releaseCancel: (() => void) | undefined
     const { api, fetch } = harness({
       open: async (endpoint, _payload, signal) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', records: [], hasMore: false }
+              await abortWait(signal)
+            },
+          }
+        }
         if (endpoint !== '$events') throw new Error(endpoint)
         return {
           async *[Symbol.asyncIterator]() {
@@ -219,6 +227,13 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
         }
       },
     })
+    // Extension ownership is claimed only after a successful prompt/create.
+    await expect(api.call(call('session.prompt', {
+      sessionId: 'session-1',
+      mode: 'queue',
+      content: [],
+    }, 'prompt-id'))).resolves.toEqual({ ok: true, value: { accepted: true } })
+
     const abort = new AbortController()
     const events = api.events(abort.signal)[Symbol.asyncIterator]()
 
@@ -269,6 +284,87 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     })
     abort.abort()
     await events.return?.()
+  })
+
+  it('declines Desktop user-question waterfalls so the native UI can answer', async () => {
+    const { api, fetch } = harness({
+      open: async (endpoint, _payload, signal) => {
+        if (endpoint !== '$events') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'ready', clientId: 'client-desktop', host: { home: '/home/test' } }
+            yield {
+              type: 'waterfall',
+              event: 'user-questions/request',
+              eventId: 'question-desktop',
+              agentId: 'desktop-session',
+              request: { questions: [{ id: 'db', question: 'Database?' }] },
+            }
+            await abortWait(signal)
+          },
+        }
+      },
+    })
+
+    const abort = new AbortController()
+    const iterator = api.events(abort.signal)[Symbol.asyncIterator]()
+    const pending = iterator.next()
+    await vi.waitFor(() => { expect(fetch).toHaveBeenCalledOnce() })
+    expect(await (fetch.mock.calls[0]?.[0] as Request).clone().json()).toMatchObject({
+      payload: { args: { eventId: 'question-desktop', outcome: { kind: 'next' } } },
+    })
+    abort.abort()
+    await expect(pending).resolves.toEqual({ done: true, value: undefined })
+  })
+
+  it('does not claim session ownership when prompt fails', async () => {
+    const error = Object.assign(new Error('rejected'), { code: 'bad-request', details: {} })
+    const { api, fetch } = harness({
+      invoke: async () => { throw error },
+      open: async (endpoint, _payload, signal) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', records: [], hasMore: false }
+              await abortWait(signal)
+            },
+          }
+        }
+        if (endpoint !== '$events') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'ready', clientId: 'client-fail', host: { home: '/home/test' } }
+            yield {
+              type: 'waterfall',
+              event: 'user-questions/request',
+              eventId: 'question-fail',
+              agentId: 'session-fail',
+              request: { questions: [{ id: 'db', question: 'Database?' }] },
+            }
+            await abortWait(signal)
+          },
+        }
+      },
+    })
+
+    await expect(api.call(call('session.prompt', {
+      sessionId: 'session-fail',
+      mode: 'queue',
+      content: [],
+    }))).resolves.toEqual({
+      ok: false,
+      error: { code: 'bad-request', message: 'rejected', details: {} },
+    })
+
+    const abort = new AbortController()
+    const iterator = api.events(abort.signal)[Symbol.asyncIterator]()
+    const pending = iterator.next()
+    await vi.waitFor(() => { expect(fetch).toHaveBeenCalledOnce() })
+    expect(await (fetch.mock.calls[0]?.[0] as Request).clone().json()).toMatchObject({
+      payload: { args: { eventId: 'question-fail', outcome: { kind: 'next' } } },
+    })
+    abort.abort()
+    await expect(pending).resolves.toEqual({ done: true, value: undefined })
   })
 
   it('delegates unhandled waterfalls and preserves Gateway failure fields', async () => {

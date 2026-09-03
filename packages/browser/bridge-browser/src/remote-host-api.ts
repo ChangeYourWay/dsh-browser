@@ -17,6 +17,10 @@ import type {
   HostRpcResult,
 } from './host-api.ts'
 import { hostFailure, isRecord } from './host-api.ts'
+import {
+  ExtensionSessionRegistry,
+  shouldBridgeOwnQuestion,
+} from './extension-sessions.ts'
 import type { RespondResult } from './protocol.ts'
 
 /** Structural subset of dsh 0.1.2's Host TypertGateway service. */
@@ -68,6 +72,7 @@ export function createRemoteHostApi(
 
 class RemoteHostApi implements BrowserHostApi {
   private readonly fetchHandler: ReturnType<HostConnectionLike['createSharedFetchHandler']>
+  private readonly extensionSessions = new ExtensionSessionRegistry()
   private activeEvents: EventGeneration | undefined
 
   constructor(
@@ -98,6 +103,14 @@ class RemoteHostApi implements BrowserHostApi {
         args: target.args,
         signal: call.signal,
       })
+      // Only claim ownership after a successful create/prompt. A failed prompt
+      // against a Desktop session must not steal later ask_user_question away
+      // from the native waterfall.
+      if (call.method === 'session.create' || call.method === 'session.prompt') {
+        this.extensionSessions.note(sessionIdOf(call.payload))
+        this.extensionSessions.note(sessionIdOf(value))
+        if (typeof value === 'string') this.extensionSessions.note(value)
+      }
       return { ok: true, value: target.adapt?.(value) ?? value }
     } catch (error: unknown) {
       return { ok: false, error: this.failure(error) }
@@ -108,6 +121,7 @@ class RemoteHostApi implements BrowserHostApi {
     const generation = new EventGeneration(
       this.gateway,
       this.sendRemoteEventResult.bind(this),
+      this.extensionSessions,
       signal,
     )
     const previous = this.activeEvents
@@ -245,6 +259,7 @@ class EventGeneration {
   constructor(
     private readonly gateway: TypertGatewayLike,
     private readonly sendResult: SendRemoteEventResult,
+    private readonly extensionSessions: ExtensionSessionRegistry,
     outerSignal: AbortSignal,
   ) {
     this.signal = AbortSignal.any([outerSignal, this.lifetime.signal])
@@ -412,6 +427,19 @@ class EventGeneration {
       throw new TypeError('$events emitted an invalid waterfall frame')
     }
     if (value.event !== 'user-questions/request' || !Array.isArray(value.request.questions)) {
+      const clientId = this.clientId
+      if (clientId !== undefined) {
+        await this.sendResult(clientId, value.eventId, { kind: 'next' }, this.signal)
+      }
+      return
+    }
+    // Desktop-owned sessions keep the native waterfall. Only forward questions
+    // for sessions the extension successfully created or prompted.
+    if (!shouldBridgeOwnQuestion({
+      hasExtensionConnection: true,
+      sessionId: value.agentId,
+      extensionSessions: this.extensionSessions,
+    })) {
       const clientId = this.clientId
       if (clientId !== undefined) {
         await this.sendResult(clientId, value.eventId, { kind: 'next' }, this.signal)
