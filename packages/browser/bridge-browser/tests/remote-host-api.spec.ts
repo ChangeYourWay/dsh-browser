@@ -260,6 +260,43 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     })
   })
 
+  it('fails closed when session/page records omit a usable event envelope', async () => {
+    const { api } = harness({
+      invoke: async ({ namespace, method }) => {
+        if (`${namespace}/${method}` !== 'session/page') throw new Error(`${namespace}/${method}`)
+        return {
+          records: [
+            { type: 'event', event: { type: 'user/message', seq: 1, time: 1, data: {} } },
+            { type: 'event' },
+          ],
+          hasMore: false,
+        }
+      },
+      open: async (endpoint) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: 5, records: [], hasMore: false }
+            },
+          }
+        }
+        throw new Error(endpoint)
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: 3,
+    }))).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'session history carried an invalid record',
+        details: {},
+      },
+    })
+  })
+
   it('reads workspace.list from the workspace/follow baseline', async () => {
     const { api, open } = harness({
       open: async (endpoint) => ({

@@ -702,9 +702,18 @@ function optionalPositiveInteger(
 }
 
 function historyRecordEvents(record: unknown): Record<string, unknown>[] {
-  if (!isRecord(record) || !isRecord(record.event)) return []
+  if (!isRecord(record)
+    || (record.type !== 'event' && record.type !== 'chunks')
+    || !isRecord(record.event)) {
+    throw new TypeError('session history carried an invalid record')
+  }
   const event = record.event
-  if (!isChunkRowEvent(event)) return [event]
+  if (!isChunkRowEvent(event)) {
+    if (record.type === 'chunks') {
+      throw new TypeError('session history chunks record carried a non-chunk event')
+    }
+    return [event]
+  }
 
   const data = event.data
   const members = event.type === 'chunkrow/tool-call-chunks' ? data.args : data.texts
