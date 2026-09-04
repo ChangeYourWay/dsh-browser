@@ -64,7 +64,7 @@ interface PendingQuestion {
   settled: boolean
 }
 
-/** Build the sole Host implementation supported by this bridge. */
+/** Build the dsh 0.1.2 Host implementation. */
 export function createRemoteHostApi(
   gateway: TypertGatewayLike,
   connection: HostConnectionLike,
@@ -413,6 +413,10 @@ class EventGeneration {
     try {
       while (!signal.aborted) {
         const next = await iterator.next()
+        // Abort is advisory to an AsyncIterator: a buffered frame may still
+        // resolve after this follower was replaced. Never let that stale
+        // generation update the extension's active/recent session state.
+        if (signal.aborted || revision !== this.followRevision) break
         if (next.done) break
         if (!isSessionEventEntry(next.value)) {
           throw new TypeError('session/follow emitted an invalid incremental frame')
@@ -425,7 +429,9 @@ class EventGeneration {
           payload: { type: 'session/event', sessionId, event: next.value.event },
         })
       }
-      if (!signal.aborted) throw new Error('session/follow ended unexpectedly')
+      if (!signal.aborted && revision === this.followRevision) {
+        throw new Error('session/follow ended unexpectedly')
+      }
     } catch (error: unknown) {
       if (!signal.aborted && revision === this.followRevision) this.queue.fail(error)
     } finally {

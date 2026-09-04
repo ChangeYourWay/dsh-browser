@@ -10,7 +10,9 @@ import { apply, assertPositiveInteger, Config, resolveConfig } from '../src/inde
 function stubContext(): Context {
   const gateway = {
     wireStream: {
-      open: async (): Promise<AsyncIterable<unknown>> => ({ async *[Symbol.asyncIterator]() {} }),
+      open: async (): Promise<AsyncIterable<unknown>> => ({
+        async *[Symbol.asyncIterator]() { yield { type: 'ready', clientId: 'test', host: { home: '/tmp' } } },
+      }),
       failure: (error: unknown) => ({ code: 'internal', message: String(error), details: {} }),
     },
     invoke: async () => undefined,

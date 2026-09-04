@@ -41,7 +41,7 @@ import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts
 import { BRIDGE_CONFIG_PATH, BRIDGE_PATH } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import { BridgeClient, type BridgeState } from './bridge.ts'
 import { createRpc } from './rpc.ts'
-import { dispatchToolCall, resetTabSnapshot, type ToolAnswer, type ToolCall } from './tools.ts'
+import { dispatchOpenTab, dispatchToolCall, resetTabSnapshot, type ToolAnswer, type ToolCall } from './tools.ts'
 import {
   isApprovalDecision,
   type ApprovalAuthorization,
@@ -57,6 +57,7 @@ import {
 import { TransientEventCache } from './transient-events.ts'
 import {
   TabAffinityController,
+  isTabAffinityDecision,
   type AffinityTab,
   type TabAffinityDecision,
 } from './tab-affinity.ts'
@@ -144,7 +145,7 @@ const STORAGE_KEY = 'dshSettings'
 const TAB_AFFINITY_STORAGE_KEY = 'dshTabAffinity'
 
 type StoredTabAffinity =
-  | { controlledTabId: number; keptActiveTabId?: number; sessionTabs?: Record<string, AffinityTab>; focusedSessionId?: string }
+  | { controlledTabId: number; keptActiveTabId?: number; pinned?: true; sessionTabs?: Record<string, AffinityTab>; focusedSessionId?: string }
   | { lost: true; sessionTabs?: Record<string, AffinityTab>; focusedSessionId?: string }
 
 let settings: Settings = { ...SETTINGS_DEFAULTS }
@@ -491,6 +492,7 @@ function storedAffinity(): StoredTabAffinity | null {
       ...(state.status === 'background' && state.active !== null
         ? { keptActiveTabId: state.active.tabId }
         : {}),
+      ...(state.pinned ? { pinned: true as const } : {}),
       ...(hasSessionTabs ? { sessionTabs } : {}),
       ...focus,
     }
@@ -570,6 +572,7 @@ async function restoreTabAffinity(): Promise<void> {
         ...(typeof keptActiveTabId === 'number' && Number.isInteger(keptActiveTabId) && keptActiveTabId >= 0
           ? { keptActiveTabId }
           : {}),
+        ...((candidate as { pinned?: unknown }).pinned === true ? { pinned: true as const } : {}),
         ...(typeof sessionTabs === 'object' && sessionTabs !== null ? { sessionTabs } : {}),
         ...focus,
       }
@@ -615,6 +618,9 @@ async function restoreTabAffinity(): Promise<void> {
     tabAffinity.restoreLost()
   }
 
+  // Restore the pin before syncing the active tab: otherwise the sync would
+  // surface a handoff prompt for a switch the user already said not to ask about.
+  if (record !== null && 'pinned' in record && record.pinned === true) tabAffinity.restorePinned()
   await syncActiveTab()
   if (record !== null && 'keptActiveTabId' in record) {
     const state = tabAffinity.snapshot()
@@ -696,6 +702,42 @@ async function resolveToolTab(sessionId?: string): Promise<Pick<chrome.tabs.Tab,
     }
   }
   return affinityFailure('handoff')
+}
+
+/**
+ * Pick a window for browser_open_tab without requiring an already-controlled page.
+ * Handoff still blocks: the user must finish the keep/follow choice first.
+ */
+async function resolveOpenTabWindow(sessionId?: string): Promise<{ windowId: number } | ToolAnswer> {
+  await affinityReady
+  const resolution = tabAffinity.resolveTarget(sessionId)
+  if (resolution.kind === 'handoff') return affinityFailure('handoff')
+  if (resolution.kind === 'target') {
+    try {
+      const tab = await chrome.tabs.get(resolution.tab.tabId)
+      return { windowId: tab.windowId }
+    } catch {
+      // Fall through to the focused window when the prior controlled tab is gone.
+    }
+  }
+  try {
+    const focused = await chrome.windows.getLastFocused()
+    if (focused.id !== undefined) return { windowId: focused.id }
+  } catch { /* no focused window */ }
+  const [fallback] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+  if (fallback?.windowId !== undefined) return { windowId: fallback.windowId }
+  return affinityFailure('missing')
+}
+
+function bindOpenedTab(tab: chrome.tabs.Tab, sessionId?: string): boolean {
+  const summary = summarizeTab(tab)
+  if (summary === null) return false
+  const sid = sessionId?.trim()
+  if (sid !== undefined && sid !== '') tabAffinity.rebindActive(summary, sid)
+  else tabAffinity.rebindActive(summary)
+  persistTabAffinity()
+  broadcastTabAffinity()
+  return true
 }
 
 async function authorizeToolCall(
@@ -851,19 +893,35 @@ function routeToolCall(call: ToolCall): void {
   const budget = caps === null
     ? undefined
     : { maxItems: caps.maxInteractiveItems, maxChars: caps.snapshotMaxChars }
-  void resolveToolTab(call.sessionId).then((target) => 'ok' in target
-    ? target
-    : dispatchToolCall(
-        call,
-        settings.sharePageContent,
-        budget,
-        (prompt) => authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
-        controller.signal,
-        target,
-        () => target.id !== undefined && tabAffinity.allowsTarget(target.id, call.sessionId),
-      )).then(
+  void (call.name === 'browser_open_tab'
+    ? resolveOpenTabWindow(call.sessionId).then((target) => 'ok' in target
+      ? target
+      : dispatchOpenTab(
+          call,
+          target.windowId,
+          settings.sharePageContent,
+          budget,
+          (prompt) => authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
+          controller.signal,
+          (tab) => bindOpenedTab(tab, call.sessionId),
+          (tabId) => tabAffinity.allowsTarget(tabId, call.sessionId),
+        ))
+    : resolveToolTab(call.sessionId).then((target) => 'ok' in target
+      ? target
+      : dispatchToolCall(
+          call,
+          settings.sharePageContent,
+          budget,
+          (prompt) => authorizeToolCall(prompt, controller.signal, target.windowId, call.sessionId),
+          controller.signal,
+          target,
+          () => target.id !== undefined && tabAffinity.allowsTarget(target.id, call.sessionId),
+        ))
+  ).then(
     (answer) => {
-      if (controller.signal.aborted) {
+      // A committed browser_open_tab already rebound affinity; prefer that
+      // factual success over a generic cancel that would leave the model wrong.
+      if (controller.signal.aborted && !(call.name === 'browser_open_tab' && answer.ok)) {
         if (activeToolCalls.get(call.id) === controller) {
           bridge?.send({
             t: 'tool.result',
@@ -1181,8 +1239,7 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       case 'tab-affinity.response': {
         const response = message as { revision?: unknown; decision?: unknown; sessionId?: unknown }
-        if (typeof response.revision !== 'number'
-          || (response.decision !== 'keep' && response.decision !== 'follow')) break
+        if (typeof response.revision !== 'number' || !isTabAffinityDecision(response.decision)) break
         const sid = typeof response.sessionId === 'string' ? response.sessionId : undefined
         const decision = resolveTabAffinityResponse({
           revision: response.revision,

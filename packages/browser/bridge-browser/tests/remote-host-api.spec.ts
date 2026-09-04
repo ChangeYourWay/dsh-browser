@@ -297,6 +297,74 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     })
   })
 
+  it('drops buffered events from a session follower after it is replaced', async () => {
+    let releaseStale!: () => void
+    let releaseFresh!: () => void
+    let staleClosed = false
+    const staleGate = new Promise<void>((resolve) => { releaseStale = resolve })
+    const freshGate = new Promise<void>((resolve) => { releaseFresh = resolve })
+    const { api } = harness({
+      open: async (endpoint, payload, signal) => {
+        if (endpoint === '$events') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'ready', clientId: 'client-1', host: { home: '/home/test' } }
+              await abortWait(signal)
+            },
+          }
+        }
+        if (endpoint !== 'session/follow') throw new Error(endpoint)
+        const sessionId = (payload as {
+          args: { request: { address: { sessionId: string } } }
+        }).args.request.address.sessionId
+        const stale = sessionId === 'session-old'
+        return {
+          async *[Symbol.asyncIterator]() {
+            try {
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
+              // Deliberately ignore abort while this read is pending: some
+              // iterators can still release one buffered frame after abort.
+              await (stale ? staleGate : freshGate)
+              yield {
+                type: 'event',
+                event: { type: 'turn/start', seq: stale ? 1 : 2, time: 3, data: {} },
+              }
+              await abortWait(signal)
+            } finally {
+              if (stale) staleClosed = true
+            }
+          },
+        }
+      },
+    })
+    const abort = new AbortController()
+    const events = api.events(abort.signal)[Symbol.asyncIterator]()
+    const nextEvent = events.next()
+
+    await expect(api.call(call('session.history', { sessionId: 'session-old' })))
+      .resolves.toMatchObject({ ok: true })
+    await expect(api.call(call('session.history', { sessionId: 'session-new' })))
+      .resolves.toMatchObject({ ok: true })
+
+    releaseStale()
+    await vi.waitFor(() => { expect(staleClosed).toBe(true) })
+    releaseFresh()
+    await expect(nextEvent).resolves.toEqual({
+      done: false,
+      value: expect.objectContaining({
+        method: 'session/event',
+        payload: {
+          type: 'session/event',
+          sessionId: 'session-new',
+          event: { type: 'turn/start', seq: 2, time: 3, data: {} },
+        },
+      }),
+    })
+
+    abort.abort()
+    await events.return?.()
+  })
+
   it('reads workspace.list from the workspace/follow baseline', async () => {
     const { api, open } = harness({
       open: async (endpoint) => ({

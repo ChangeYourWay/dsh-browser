@@ -1,9 +1,9 @@
 /**
  * Bridge-owned Host API consumed by the WebSocket carrier.
  *
- * dsh 0.1.2 exposes Typert Remote services plus Connection-owned carriers.
- * This boundary keeps that Host topology out of the browser wire server; it
- * is deliberately implemented only by the 0.1.2 Remote adapter.
+ * This boundary keeps release-specific Host topology out of the browser wire
+ * server. dsh 0.1.2 implements it with Typert Remotes and Connection; the
+ * temporary 0.1.1-rc.2 compatibility island implements it with ApiProxy.
  *
  * @module
  */
@@ -17,7 +17,7 @@ export interface HostRpcFailure {
   readonly details: object
 }
 
-/** Business result returned by the dsh 0.1.2 Host adapter. */
+/** Business result returned by the active dsh Host adapter. */
 export type HostRpcResult<T = unknown> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: HostRpcFailure }
