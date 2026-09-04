@@ -66,6 +66,23 @@ describe('PageSessionContextTracker', () => {
     })
   })
 
+  it('keeps only the newest restored tab when storage contains a duplicate session', async () => {
+    const tracker = new PageSessionContextTracker({
+      read: async () => ({
+        version: 1,
+        tabs: {
+          1: { sessionId: 'session', windowId: 1, urlKey: 'https://example.com/old', updatedAt: 1 },
+          2: { sessionId: 'session', windowId: 1, urlKey: 'https://example.com/new', updatedAt: 2 },
+        },
+      }),
+      write: async () => {},
+    })
+    await tracker.ready
+
+    expect(tracker.candidate(webTab(1, 'https://example.com/old'))).toBeNull()
+    expect(tracker.candidate(webTab(2, 'https://example.com/new'))).toBe('session')
+  })
+
   it('removes unsupported-page bindings instead of leaving a stale checkpoint', async () => {
     const tracker = new PageSessionContextTracker({ read: async () => undefined, write: async () => {} })
     await tracker.ready

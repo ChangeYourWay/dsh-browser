@@ -147,6 +147,11 @@ function parseStoredContexts(value: unknown): Map<number, PageSessionContext> {
       ? context.updatedAt
       : undefined
     if (sessionId === undefined || windowId === undefined || urlKey === undefined || updatedAt === undefined) continue
+    const duplicate = [...restored.entries()].find(([, candidate]) => candidate.sessionId === sessionId)
+    if (duplicate !== undefined) {
+      if (duplicate[1].updatedAt > updatedAt) continue
+      restored.delete(duplicate[0])
+    }
     restored.set(tabId, { sessionId, windowId, urlKey, updatedAt })
   }
   return restored

@@ -891,7 +891,7 @@ async function resolveTabAffinityResponse(response: {
 
 /** Move browser control to the current tab only after a fresh, valid query. */
 async function rebindTabAffinityToActive(signal: AbortSignal, sessionId?: string): Promise<void> {
-  await abortable(affinityReady, signal)
+  await abortable(Promise.all([affinityReady, pageSessionContexts.ready]).then(() => undefined), signal)
   const tab = await syncActiveTab(undefined, signal)
   throwIfRebindAborted(signal)
   const summary = tab === undefined ? null : summarizeTab(tab)
@@ -908,7 +908,6 @@ async function rebindTabAffinityToActive(signal: AbortSignal, sessionId?: string
   }
   tabAffinity.rebindActive(summary, sessionId)
   if (sessionId !== undefined) {
-    await pageSessionContexts.ready
     pageSessionContexts.bind(sessionId, { id: summary.tabId, ...summary })
   }
   if (previousControlledTabId !== undefined && previousControlledTabId !== summary.tabId) {
