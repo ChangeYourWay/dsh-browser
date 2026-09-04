@@ -93,7 +93,7 @@ describe('panel session transitions', () => {
     rpc.mockImplementation(async (method: string, payload?: unknown) => {
       if (method === 'session.list') {
         return { items: [
-          { sessionId: 'session-page', updatedAt: 2, running: false, blank: false },
+          { sessionId: 'session-page', updatedAt: 2, running: true, blank: true },
           { sessionId: 'session-global', updatedAt: 1, running: false, blank: false },
         ] }
       }

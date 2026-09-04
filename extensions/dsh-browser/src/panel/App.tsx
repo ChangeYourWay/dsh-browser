@@ -1011,8 +1011,11 @@ export function App(): React.JSX.Element {
     applyHistory(created.sessionId, await readHistory(created.sessionId))
   }
 
-  /** 拉取会话列表并排除已归档条目：上游 session.list 不做归档过滤，已删除会话会以冷/附着形态残留。 */
-  async function loadVisibleSessions(): Promise<SessionPickerEntry[]> {
+  /** Load the raw host index plus workspace archive state once. */
+  async function loadSessionCatalog(): Promise<{
+    items: SessionPickerEntry[]
+    archived: Set<string>
+  }> {
     const [listed, workspaces] = await Promise.all([
       api.rpc<{ items: SessionPickerEntry[] }>('session.list', {}),
       api.rpc<{ archivedSessionIds?: string[] }>('workspace.list', {}).catch(() => ({ archivedSessionIds: [] as string[] })),
@@ -1021,7 +1024,13 @@ export function App(): React.JSX.Element {
     for (const entry of listed.items ?? []) {
       sessionRuntimeRef.current.seedRunning(entry.sessionId, entry.running)
     }
-    return resumableSessions(listed.items ?? []).filter((entry) => !archived.has(entry.sessionId))
+    return { items: listed.items ?? [], archived }
+  }
+
+  /** Filter the raw catalog for the manual history picker. */
+  async function loadVisibleSessions(): Promise<SessionPickerEntry[]> {
+    const { items, archived } = await loadSessionCatalog()
+    return resumableSessions(items).filter((entry) => !archived.has(entry.sessionId))
   }
 
   /** Restore only the exact current-page conversation, otherwise create a chat. */
@@ -1033,8 +1042,12 @@ export function App(): React.JSX.Element {
       const hinted = settings?.autoResumeSession === true ? resumeHint.sessionId : null
       if (hinted !== null && hinted.trim() !== '') {
         try {
-          const entries = await loadVisibleSessions()
-          const entry = entries.find((candidate) => candidate.sessionId === hinted)
+          const { items, archived } = await loadSessionCatalog()
+          // A contextual hint may identify a live provisional/blank session,
+          // which is intentionally hidden only from the manual history picker.
+          const entry = archived.has(hinted)
+            ? undefined
+            : items.find((candidate) => candidate.sessionId === hinted && candidate.origin !== 'subagent')
           if (entry !== undefined) {
             const history = await readHistory(hinted)
             if (sessionTransitionRef.current !== transition) return
