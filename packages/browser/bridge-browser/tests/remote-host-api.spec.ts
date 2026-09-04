@@ -105,6 +105,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
             async *[Symbol.asyncIterator]() {
               yield {
                 type: 'snapshot',
+                cursor: 3,
                 records: [
                   { type: 'event', event: { type: 'user/message', seq: 0, time: 1, data: {} } },
                   {
@@ -133,7 +134,10 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     const live = events.next()
     await vi.waitFor(() => { expect(open).toHaveBeenCalledWith('$events', { args: {} }, expect.any(AbortSignal)) })
 
-    await expect(api.call(call('session.history', { sessionId: 'session-1' }))).resolves.toEqual({
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      maxMessages: 2,
+    }))).resolves.toEqual({
       ok: true,
       value: {
         events: [
@@ -173,10 +177,182 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
       }),
     })
     expect(open).toHaveBeenCalledWith('session/follow', {
-      args: { request: { address: { kind: 'session', sessionId: 'session-1' } } },
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: 'session-1' },
+          maxMessages: 2,
+        },
+      },
     }, expect.any(AbortSignal))
     abort.abort()
     await events.return?.()
+  })
+
+  it('forwards tail-page size through a one-shot session/follow snapshot', async () => {
+    const { api, open } = harness({
+      open: async (endpoint) => {
+        if (endpoint !== 'session/follow') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
+          },
+        }
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-one-shot',
+      maxMessages: 12,
+    }))).resolves.toEqual({
+      ok: true,
+      value: { events: [], hasMore: false },
+    })
+    expect(open).toHaveBeenCalledWith('session/follow', {
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: 'session-one-shot' },
+          maxMessages: 12,
+        },
+      },
+    }, expect.any(AbortSignal))
+  })
+
+  it('rejects invalid history pagination before calling the Host', async () => {
+    const { api, invoke, open } = harness()
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: -1,
+    }))).resolves.toEqual({
+      ok: false,
+      error: { code: 'bad-request', message: 'beforeSeq must be a non-negative safe integer', details: {} },
+    })
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      maxMessages: 0,
+    }))).resolves.toEqual({
+      ok: false,
+      error: { code: 'bad-request', message: 'maxMessages must be a positive safe integer', details: {} },
+    })
+    expect(open).not.toHaveBeenCalled()
+    expect(invoke).not.toHaveBeenCalled()
+  })
+
+  it('pages older history with a Host-legal throughSeq, never MAX_SAFE_INTEGER', async () => {
+    const { api, invoke, open } = harness({
+      invoke: async ({ namespace, method, args }) => {
+        if (`${namespace}/${method}` !== 'session/page') throw new Error(`${namespace}/${method}`)
+        expect(args).toEqual({
+          request: {
+            address: { kind: 'session', sessionId: 'session-1' },
+            throughSeq: 42,
+            beforeSeq: 10,
+            maxMessages: 20,
+          },
+        })
+        return {
+          records: [{ type: 'event', event: { type: 'user/message', seq: 9, time: 1, data: {} } }],
+          hasMore: true,
+        }
+      },
+      open: async (endpoint) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: 42, records: [], hasMore: false }
+            },
+          }
+        }
+        throw new Error(endpoint)
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: 10,
+      maxMessages: 20,
+    }))).resolves.toEqual({
+      ok: true,
+      value: {
+        events: [{ event: { type: 'user/message', seq: 9, time: 1, data: {} } }],
+        hasMore: true,
+      },
+    })
+    expect(open).toHaveBeenCalledWith('session/follow', {
+      args: { request: { address: { kind: 'session', sessionId: 'session-1' } } },
+    }, expect.any(AbortSignal))
+    expect(invoke).toHaveBeenCalledOnce()
+    const pageArgs = invoke.mock.calls[0]?.[0]?.args as { request: { throughSeq: number } }
+    expect(pageArgs.request.throughSeq).toBe(42)
+    expect(pageArgs.request.throughSeq).not.toBe(Number.MAX_SAFE_INTEGER)
+  })
+
+  it('fails closed when session/page returns a malformed history page', async () => {
+    const { api } = harness({
+      invoke: async ({ namespace, method }) => {
+        if (`${namespace}/${method}` !== 'session/page') throw new Error(`${namespace}/${method}`)
+        return { records: 'not-an-array' }
+      },
+      open: async (endpoint) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: 5, records: [], hasMore: false }
+            },
+          }
+        }
+        throw new Error(endpoint)
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: 3,
+    }))).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'session/page returned an invalid history page',
+        details: {},
+      },
+    })
+  })
+
+  it('fails closed when session/page records omit a usable event envelope', async () => {
+    const { api } = harness({
+      invoke: async ({ namespace, method }) => {
+        if (`${namespace}/${method}` !== 'session/page') throw new Error(`${namespace}/${method}`)
+        return {
+          records: [
+            { type: 'event', event: { type: 'user/message', seq: 1, time: 1, data: {} } },
+            { type: 'event' },
+          ],
+          hasMore: false,
+        }
+      },
+      open: async (endpoint) => {
+        if (endpoint === 'session/follow') {
+          return {
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'snapshot', cursor: 5, records: [], hasMore: false }
+            },
+          }
+        }
+        throw new Error(endpoint)
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: 3,
+    }))).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'internal',
+        message: 'session history carried an invalid record',
+        details: {},
+      },
+    })
   })
 
   it('drops buffered events from a session follower after it is replaced', async () => {
@@ -203,7 +379,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
         return {
           async *[Symbol.asyncIterator]() {
             try {
-              yield { type: 'snapshot', records: [], hasMore: false }
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
               // Deliberately ignore abort while this read is pending: some
               // iterators can still release one buffered frame after abort.
               await (stale ? staleGate : freshGate)
@@ -272,7 +448,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
         if (endpoint === 'session/follow') {
           return {
             async *[Symbol.asyncIterator]() {
-              yield { type: 'snapshot', records: [], hasMore: false }
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
               await abortWait(signal)
             },
           }
@@ -393,7 +569,7 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
         if (endpoint === 'session/follow') {
           return {
             async *[Symbol.asyncIterator]() {
-              yield { type: 'snapshot', records: [], hasMore: false }
+              yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
               await abortWait(signal)
             },
           }
