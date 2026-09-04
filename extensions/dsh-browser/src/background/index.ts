@@ -678,6 +678,19 @@ async function postResumeHint(port: chrome.runtime.Port, windowId: number): Prom
   try { port.postMessage({ type: 'session.resume-hint', sessionId }) } catch { /* port closed */ }
 }
 
+/** Re-checkpoint each open panel before issuing a bridge-epoch resume hint. */
+function refreshPanelResumeHints(): void {
+  for (const port of panelPorts) {
+    const windowId = panelWindows.get(port)
+    if (windowId === undefined) continue
+    const sessionId = panelActiveSessions.get(port)
+    const checkpoint = sessionId === undefined
+      ? Promise.resolve()
+      : checkpointSessionPage(sessionId)
+    void checkpoint.then(() => postResumeHint(port, windowId), () => postResumeHint(port, windowId))
+  }
+}
+
 /** Bind at prompt submission so a switch while the model is thinking is visible. */
 async function ensureInitialTabBinding(sessionId?: string): Promise<boolean> {
   await affinityReady
@@ -1070,6 +1083,7 @@ async function startBridge(): Promise<void> {
           transientEvents.clear()
         }
         broadcastStatus()
+        if (state === 'stopped') refreshPanelResumeHints()
         if (state === 'stopped' && panelPorts.size === 0) disarmBridgeKeepalive()
       },
       onFrame: (frame) => {

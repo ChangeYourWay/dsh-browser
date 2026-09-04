@@ -167,6 +167,33 @@ describe('panel session transitions', () => {
     expect(rpc).not.toHaveBeenCalledWith('session.list', {})
   })
 
+  it('waits for a fresh contextual hint after a bridge restart', async () => {
+    const storageGet = chrome.storage.local.get as unknown as Mock
+    storageGet.mockResolvedValue({ dshSettings: { autoResumeSession: true } })
+    rpc.mockImplementation(async (method: string) => {
+      if (method === 'session.list') {
+        return { items: [{ sessionId: 'session-page', updatedAt: 1, running: false, blank: false }] }
+      }
+      if (method === 'workspace.list') return { archivedSessionIds: [] }
+      if (method === 'session.history') return { events: [] }
+      if (method === 'session.create') return { sessionId: 'session-after-restart' }
+      throw new Error(`unexpected RPC: ${method}`)
+    })
+    panelApi.setActiveSession = vi.fn(async () => {})
+    await renderConnected('session-page')
+    await vi.waitFor(() => { expect(panelApi.setActiveSession).toHaveBeenCalledWith('session-page') })
+
+    await act(async () => { onStatus?.('stopped', null) })
+    await act(async () => { onStatus?.('connected', null) })
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(panelApi.setActiveSession).toHaveBeenCalledTimes(1)
+
+    await act(async () => { onResumeHint?.(null) })
+    await vi.waitFor(() => {
+      expect(panelApi.setActiveSession).toHaveBeenCalledWith('session-after-restart', true)
+    })
+  })
+
   it('releases the controls and surfaces an activation failure', async () => {
     await act(async () => { root.render(createElement(App)) })
     await act(async () => {
