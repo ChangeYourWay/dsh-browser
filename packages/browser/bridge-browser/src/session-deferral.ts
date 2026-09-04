@@ -12,22 +12,16 @@
  * @module @yuxianglin/dsh-bridge-browser/src/session-deferral
  */
 
-import { randomUUID } from 'node:crypto'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
-import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { BrowserHostApi, HostRpcCall, HostRpcResult } from './host-api.ts'
+import { isRecord } from './host-api.ts'
 
 /** Provisional entries older than this are dropped on the next create. */
 const PROVISIONAL_TTL_MS = 30 * 60_000
 
-type CreateRequest = Parameters<ApiProxy['sessions']['create']>[0]
-type HistoryRequest = Parameters<ApiProxy['sessions']['history']>[0]
-type PromptRequest = Parameters<ApiProxy['sessions']['prompt']>[0]
-
 interface ProvisionalEntry {
   /** The original create payload, replayed at materialization (keeps cwd/workspaceId). */
-  payload: CreateRequest['payload']
+  payload: Record<string, unknown>
   createdAt: number
 }
 
@@ -43,14 +37,14 @@ interface ProvisionalEntry {
  * @returns the original API when disabled, otherwise the wrapped API.
  */
 export function withSessionDeferral(
-  api: ApiProxy,
+  api: BrowserHostApi,
   enabled: boolean,
   imageLimits?: ImageAttachmentLimits,
-): ApiProxy {
+): BrowserHostApi {
   if (!enabled) return api
 
-  const provisional = new Map<SessionId, ProvisionalEntry>()
-  const materializing = new Map<SessionId, ReturnType<ApiProxy['sessions']['create']>>()
+  const provisional = new Map<string, ProvisionalEntry>()
+  const materializing = new Map<string, Promise<HostRpcResult>>()
 
   const prune = (): void => {
     const cutoff = Date.now() - PROVISIONAL_TTL_MS
@@ -59,60 +53,64 @@ export function withSessionDeferral(
     }
   }
 
-  const mintedId = (payload: CreateRequest['payload']): SessionId =>
-    payload.sessionId ?? `session-${randomUUID()}` as SessionId
+  const mintedId = (payload: Record<string, unknown>): string =>
+    typeof payload.sessionId === 'string' ? payload.sessionId : `session-${crypto.randomUUID()}`
 
   return {
-    ...api,
-    sessions: {
-      ...api.sessions,
-      async create(request: CreateRequest) {
+    async call(call: HostRpcCall): Promise<HostRpcResult> {
+      if (call.method === 'session.create') {
+        if (!isRecord(call.payload)) {
+          return { ok: false, error: { code: 'bad-request', message: 'session.create payload must be an object', details: {} } }
+        }
         prune()
-        const sessionId = mintedId(request.payload)
-        provisional.set(sessionId, { payload: { ...request.payload }, createdAt: Date.now() })
-        return { rpcId: request.rpcId, result: { ok: true, value: { sessionId } } }
-      },
-      async history(request: HistoryRequest) {
-        if (!provisional.has(request.payload.sessionId)) return api.sessions.history(request)
+        const sessionId = mintedId(call.payload)
+        provisional.set(sessionId, { payload: { ...call.payload }, createdAt: Date.now() })
+        return { ok: true, value: { sessionId } }
+      }
+      if (call.method === 'session.history') {
+        const sessionId = sessionIdOf(call.payload)
+        if (sessionId === undefined || !provisional.has(sessionId)) return api.call(call)
         return {
-          rpcId: request.rpcId,
-          result: {
-            ok: true,
-            value: {
-              events: [],
-              hasMore: false,
-              ...(imageLimits === undefined
-                ? {}
-                : { projections: { asOfSeq: -1, values: { imageLimits } } }),
-            },
+          ok: true,
+          value: {
+            events: [],
+            hasMore: false,
+            ...(imageLimits === undefined
+              ? {}
+              : { projections: { asOfSeq: -1, values: { imageLimits } } }),
           },
         }
-      },
-      async prompt(request: PromptRequest) {
-        const entry = provisional.get(request.payload.sessionId)
-        if (entry === undefined) return api.sessions.prompt(request)
-        const existing = materializing.get(request.payload.sessionId)
-        const pending = existing ?? api.sessions.create({
-          rpcId: RpcId(randomUUID()),
-          payload: { ...entry.payload, sessionId: request.payload.sessionId },
-        })
-        if (existing === undefined) {
-          materializing.set(request.payload.sessionId, pending)
-          void pending.then(
-            () => { materializing.delete(request.payload.sessionId) },
-            () => { materializing.delete(request.payload.sessionId) },
-          )
-        }
-        const created = await pending
-        if (!created.result.ok) {
-          // The create failure value shape differs from prompt's success
-          // shape; the carrier relays only result.ok/error, so the value
-          // side is irrelevant here.
-          return created as unknown as Awaited<ReturnType<ApiProxy['sessions']['prompt']>>
-        }
-        provisional.delete(request.payload.sessionId)
-        return api.sessions.prompt(request)
-      },
+      }
+      if (call.method !== 'session.prompt') return api.call(call)
+      const sessionId = sessionIdOf(call.payload)
+      if (sessionId === undefined) return api.call(call)
+      const entry = provisional.get(sessionId)
+      if (entry === undefined) return api.call(call)
+      const existing = materializing.get(sessionId)
+      const pending = existing ?? api.call({
+        rpcId: crypto.randomUUID(),
+        method: 'session.create',
+        payload: { ...entry.payload, sessionId },
+        signal: call.signal,
+      })
+      if (existing === undefined) {
+        materializing.set(sessionId, pending)
+        void pending.then(
+          () => { materializing.delete(sessionId) },
+          () => { materializing.delete(sessionId) },
+        )
+      }
+      const created = await pending
+      if (!created.ok) return created
+      provisional.delete(sessionId)
+      return api.call(call)
     },
+    events: signal => api.events(signal),
+    respond: (rpcId, result, signal) => api.respond(rpcId, result, signal),
   }
+}
+
+function sessionIdOf(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined
+  return typeof payload.sessionId === 'string' ? payload.sessionId : undefined
 }
