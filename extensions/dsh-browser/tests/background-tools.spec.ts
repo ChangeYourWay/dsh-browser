@@ -593,7 +593,19 @@ describe('dispatchOpenTab', () => {
     for (const listener of runtimeListeners) {
       listener(
         { type: 'DSH_CONTENT_READY' },
-        { tab: { id: 42 }, frameId: 0, documentId: 'doc-42' } as chrome.runtime.MessageSender,
+        {
+          tab: { id: 42 }, frameId: 0, documentId: 'blank-doc', url: 'about:blank',
+        } as chrome.runtime.MessageSender,
+      )
+    }
+    await Promise.resolve()
+    expect(bindCreatedTab).not.toHaveBeenCalled()
+    for (const listener of runtimeListeners) {
+      listener(
+        { type: 'DSH_CONTENT_READY' },
+        {
+          tab: { id: 42 }, frameId: 0, documentId: 'doc-42', url: 'https://docs.example/',
+        } as chrome.runtime.MessageSender,
       )
     }
     const answer = await open
@@ -712,7 +724,9 @@ describe('dispatchOpenTab', () => {
     for (const listener of runtimeListeners) {
       listener(
         { type: 'DSH_CONTENT_READY' },
-        { tab: { id: 77 }, frameId: 0, documentId: 'doc-77' } as chrome.runtime.MessageSender,
+        {
+          tab: { id: 77 }, frameId: 0, documentId: 'doc-77', url: 'https://docs.example/',
+        } as chrome.runtime.MessageSender,
       )
     }
     const answer = await open
