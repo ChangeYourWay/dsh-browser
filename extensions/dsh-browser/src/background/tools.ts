@@ -61,6 +61,7 @@ const NAVIGATION_CANDIDATE_TOOLS = new Set([
   'browser_back',
   'browser_forward',
   'browser_reload',
+  'browser_open_tab',
 ])
 const NAVIGATION_SNAPSHOT_GUIDANCE = 'Navigation completed and the current page snapshot is included below. Use it directly instead of taking an immediate duplicate snapshot.'
 const pendingInjections = new Map<number, Promise<void>>()
@@ -69,6 +70,11 @@ const snapshotDocumentsByTab = new Map<number, Map<number, string>>()
 /** Forget delta/element state whenever the user explicitly follows a new tab. */
 export function resetTabSnapshot(tabId: number): void {
   snapshotDocumentsByTab.delete(tabId)
+}
+
+/** Whether a successful tool may have changed the controlled tab's page URL. */
+export function isNavigationCandidateTool(name: string): boolean {
+  return NAVIGATION_CANDIDATE_TOOLS.has(name)
 }
 
 function isToolAnswer(value: unknown): value is ToolAnswer {
@@ -314,7 +320,7 @@ async function dispatchOnce(
   if (targetStillAllowed?.() === false) return targetChanged()
   const hasSnapshotBaseline = snapshotDocumentsByTab.get(tabId)?.get(frameId) === frameDocumentKey(frame)
   const requestPageDelta = includeActionDelta && hasSnapshotBaseline && ACTION_DELTA_TOOLS.has(call.name)
-  const navigationWait = includeActionDelta && NAVIGATION_CANDIDATE_TOOLS.has(call.name)
+  const navigationWait = includeActionDelta && isNavigationCandidateTool(call.name)
     ? waitForNextDocumentReady(tabId, frameId, frame.documentId, signal)
     : undefined
   let response: unknown
@@ -658,4 +664,3 @@ export async function dispatchOpenTab(
     result: { text: `${status} Call browser_snapshot again after the page loads.` },
   }
 }
-

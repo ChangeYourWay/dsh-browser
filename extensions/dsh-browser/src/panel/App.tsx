@@ -68,7 +68,6 @@ import {
   resumableSessions,
   sessionAcceptsPrompts,
   sessionDisplayTitle,
-  sessionResumeCandidates,
   sessionTitleFromEvent,
   SessionRuntimeCache,
   type SessionPickerEntry,
@@ -763,6 +762,7 @@ export function App(): React.JSX.Element {
         sessionInitializationRef.current = false
         sessionChangingRef.current = false
         sessionRef.current = null
+        setResumeHint({ ready: false, sessionId: null })
         sessionRuntimeRef.current.clear()
         setRows([])
         setDraft((current) => ({ ...current, images: [] }))
@@ -1012,8 +1012,11 @@ export function App(): React.JSX.Element {
     applyHistory(created.sessionId, await readHistory(created.sessionId))
   }
 
-  /** 拉取会话列表并排除已归档条目：上游 session.list 不做归档过滤，已删除会话会以冷/附着形态残留。 */
-  async function loadVisibleSessions(): Promise<SessionPickerEntry[]> {
+  /** Load the raw host index plus workspace archive state once. */
+  async function loadSessionCatalog(): Promise<{
+    items: SessionPickerEntry[]
+    archived: Set<string>
+  }> {
     const [listed, workspaces] = await Promise.all([
       api.rpc<{ items: SessionPickerEntry[] }>('session.list', {}),
       api.rpc<{ archivedSessionIds?: string[] }>('workspace.list', {}).catch(() => ({ archivedSessionIds: [] as string[] })),
@@ -1022,41 +1025,45 @@ export function App(): React.JSX.Element {
     for (const entry of listed.items ?? []) {
       sessionRuntimeRef.current.seedRunning(entry.sessionId, entry.running)
     }
-    return resumableSessions(listed.items ?? []).filter((entry) => !archived.has(entry.sessionId))
+    return { items: listed.items ?? [], archived }
   }
 
-  /** Restore the last browser conversation, then the latest durable one, before creating a chat. */
+  /** Filter the raw catalog for the manual history picker. */
+  async function loadVisibleSessions(): Promise<SessionPickerEntry[]> {
+    const { items, archived } = await loadSessionCatalog()
+    return resumableSessions(items).filter((entry) => !archived.has(entry.sessionId))
+  }
+
+  /** Restore only the exact current-page conversation, otherwise create a chat. */
   async function initializeSession(): Promise<void> {
     if (sessionInitializationRef.current || sessionChangingRef.current || sessionRef.current !== null) return
     sessionInitializationRef.current = true
     const transition = beginSessionTransition()
     try {
-      if (settings?.autoResumeSession === true) {
-        let entries: SessionPickerEntry[] = []
+      const hinted = settings?.autoResumeSession === true ? resumeHint.sessionId : null
+      if (hinted !== null && hinted.trim() !== '') {
         try {
-          entries = await loadVisibleSessions()
-        } catch {
-          // The direct resume hint may still identify a live provisional session.
-        }
-        const hinted = resumeHint.sessionId
-        const candidates = sessionResumeCandidates(hinted, entries)
-        for (const id of candidates) {
-          try {
-            const history = await readHistory(id)
+          const { items, archived } = await loadSessionCatalog()
+          // A contextual hint may identify a live provisional/blank session,
+          // which is intentionally hidden only from the manual history picker.
+          const entry = archived.has(hinted)
+            ? undefined
+            : items.find((candidate) => candidate.sessionId === hinted && candidate.origin !== 'subagent')
+          if (entry !== undefined) {
+            const history = await readHistory(hinted)
             if (sessionTransitionRef.current !== transition) return
-            const entry = entries.find((candidate) => candidate.sessionId === id)
-            const runtime = sessionRuntimeRef.current.snapshot(id, entry?.running ?? false)
+            const runtime = sessionRuntimeRef.current.snapshot(hinted, entry.running)
             // A highlight captured while startup history is loading belongs to
             // the still-open page, so automatic restoration must not erase it.
             prepareSessionSwitch(runtime.running, runtime.questions, true)
-            sessionRef.current = id
-            await api.setActiveSession(id)
-            setSessionTitle(entry === undefined ? null : projectedSessionTitle(entry) ?? sessionDisplayTitle(entry))
-            applyHistory(id, history)
+            sessionRef.current = hinted
+            await api.setActiveSession(hinted)
+            setSessionTitle(projectedSessionTitle(entry) ?? sessionDisplayTitle(entry))
+            applyHistory(hinted, history)
             return
-          } catch {
-            // Stale hints are expected after a bridge restart; try the next durable session.
           }
+        } catch {
+          // Missing, archived, or unreadable contextual sessions start fresh.
         }
       }
       await createSession(transition)

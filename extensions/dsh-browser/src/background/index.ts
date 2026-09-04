@@ -41,7 +41,14 @@ import type { ServerFrame } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts
 import { BRIDGE_CONFIG_PATH, BRIDGE_PATH } from '@yuxianglin/dsh-bridge-browser/src/protocol.ts'
 import { BridgeClient, type BridgeState } from './bridge.ts'
 import { createRpc } from './rpc.ts'
-import { dispatchOpenTab, dispatchToolCall, resetTabSnapshot, type ToolAnswer, type ToolCall } from './tools.ts'
+import {
+  dispatchOpenTab,
+  dispatchToolCall,
+  isNavigationCandidateTool,
+  resetTabSnapshot,
+  type ToolAnswer,
+  type ToolCall,
+} from './tools.ts'
 import {
   isApprovalDecision,
   type ApprovalAuthorization,
@@ -66,9 +73,9 @@ import { SelectionTracker, type SelectionSource } from './selection.ts'
 import { parsePageSelection, parseSelectionCapture } from '../selection.ts'
 import { ApprovalCoordinator, type ApprovalRequestResult } from './approval-coordinator.ts'
 import {
-  RECENT_SESSION_STORAGE_KEY,
-  RecentSessionTracker,
-  sessionIdFromFrame,
+  LEGACY_RECENT_SESSION_STORAGE_KEY,
+  PAGE_SESSION_CONTEXT_STORAGE_KEY,
+  PageSessionContextTracker,
 } from './session-continuity.ts'
 
 /** User settings persisted in chrome.storage.local. */
@@ -80,7 +87,7 @@ export interface Settings {
   trustedActionOrigins: string[]
   /** Show an OS notification when no side panel can display an approval. */
   approvalNotifications: boolean
-  /** Restore the last active browser conversation when the panel reopens. */
+  /** Restore the current tab and page path's conversation when the panel reopens. */
   autoResumeSession: boolean
 }
 
@@ -161,12 +168,13 @@ const transientEvents = new TransientEventCache()
 const tabAffinity = new TabAffinityController()
 const focusedWindow = new FocusedWindowTracker()
 const selections = new SelectionTracker()
-const recentSession = new RecentSessionTracker({
-  read: async () => (await chrome.storage.session.get(RECENT_SESSION_STORAGE_KEY))[RECENT_SESSION_STORAGE_KEY],
-  write: async (sessionId) => {
-    await chrome.storage.session.set({ [RECENT_SESSION_STORAGE_KEY]: sessionId })
+const pageSessionContexts = new PageSessionContextTracker({
+  read: async () => (await chrome.storage.session.get(PAGE_SESSION_CONTEXT_STORAGE_KEY))[PAGE_SESSION_CONTEXT_STORAGE_KEY],
+  write: async (value) => {
+    await chrome.storage.session.set({ [PAGE_SESSION_CONTEXT_STORAGE_KEY]: value })
   },
 })
+void chrome.storage.session.remove(LEGACY_RECENT_SESSION_STORAGE_KEY).catch(() => {})
 /** Ephemeral allowlist: cleared when the last side panel closes or this worker restarts. */
 const sessionTrustedActionOrigins = new Set<string>()
 /** Tool calls that can still be withdrawn by a bridge `tool.cancel` frame. */
@@ -277,6 +285,8 @@ function broadcastTabAffinity(): void {
 
 /** Which window each panel port belongs to, so a quote stays in its window. */
 const panelWindows = new WeakMap<chrome.runtime.Port, number>()
+/** The conversation each live panel is displaying, used for close checkpoints. */
+const panelActiveSessions = new WeakMap<chrome.runtime.Port, string>()
 
 /**
  * Send one window's selection to that window's panels only.
@@ -634,6 +644,53 @@ async function restoreTabAffinity(): Promise<void> {
 
 const affinityReady = restoreTabAffinity()
 
+function validSessionId(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined
+}
+
+/** Refresh one session's recovery checkpoint from its actual controlled tab. */
+async function checkpointSessionPage(sessionValue: unknown): Promise<void> {
+  const sessionId = validSessionId(sessionValue)
+  if (sessionId === undefined) return
+  await Promise.all([affinityReady, pageSessionContexts.ready])
+  const bound = tabAffinity.getSessionTab(sessionId)
+  if (bound === undefined) return
+  try {
+    const tab = await chrome.tabs.get(bound.tabId)
+    if (tabAffinity.getSessionTab(sessionId)?.tabId !== bound.tabId) return
+    pageSessionContexts.bind(sessionId, tab)
+  } catch {
+    // A concurrently closed tab is cleaned by tabs.onRemoved.
+  }
+}
+
+/** Resolve the contextual hint only after the panel has identified its window. */
+async function postResumeHint(port: chrome.runtime.Port, windowId: number): Promise<void> {
+  await pageSessionContexts.ready
+  let sessionId: string | null = null
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, windowId })
+    if (tab !== undefined) sessionId = pageSessionContexts.candidate(tab)
+  } catch {
+    // Without an exact live page the panel must start a new conversation.
+  }
+  if (!panelPorts.has(port) || panelWindows.get(port) !== windowId) return
+  try { port.postMessage({ type: 'session.resume-hint', sessionId }) } catch { /* port closed */ }
+}
+
+/** Re-checkpoint each open panel before issuing a bridge-epoch resume hint. */
+function refreshPanelResumeHints(): void {
+  for (const port of panelPorts) {
+    const windowId = panelWindows.get(port)
+    if (windowId === undefined) continue
+    const sessionId = panelActiveSessions.get(port)
+    const checkpoint = sessionId === undefined
+      ? Promise.resolve()
+      : checkpointSessionPage(sessionId)
+    void checkpoint.then(() => postResumeHint(port, windowId), () => postResumeHint(port, windowId))
+  }
+}
+
 /** Bind at prompt submission so a switch while the model is thinking is visible. */
 async function ensureInitialTabBinding(sessionId?: string): Promise<boolean> {
   await affinityReady
@@ -735,6 +792,11 @@ function bindOpenedTab(tab: chrome.tabs.Tab, sessionId?: string): boolean {
   const sid = sessionId?.trim()
   if (sid !== undefined && sid !== '') tabAffinity.rebindActive(summary, sid)
   else tabAffinity.rebindActive(summary)
+  if (sid !== undefined && sid !== '') {
+    void pageSessionContexts.ready.then(() => {
+      pageSessionContexts.bind(sid, { id: summary.tabId, ...summary })
+    })
+  }
   persistTabAffinity()
   broadcastTabAffinity()
   return true
@@ -827,7 +889,13 @@ async function resolveTabAffinityResponse(response: {
     ? tabAffinity.snapshot().controlled
     : null
   if (controlled !== null) resetTabSnapshot(controlled.tabId)
-  if (accepted) persistTabAffinity()
+  if (accepted) {
+    persistTabAffinity()
+    if (controlled !== null && sid !== undefined) {
+      await pageSessionContexts.ready
+      pageSessionContexts.bind(sid, { id: controlled.tabId, ...controlled })
+    }
+  }
   broadcastTabAffinity()
   if (controlled !== null && typeof response.sessionId === 'string' && response.sessionId.trim() !== '') {
     await refreshFollowedPage(response.sessionId, controlled.tabId)
@@ -836,7 +904,7 @@ async function resolveTabAffinityResponse(response: {
 
 /** Move browser control to the current tab only after a fresh, valid query. */
 async function rebindTabAffinityToActive(signal: AbortSignal, sessionId?: string): Promise<void> {
-  await abortable(affinityReady, signal)
+  await abortable(Promise.all([affinityReady, pageSessionContexts.ready]).then(() => undefined), signal)
   const tab = await syncActiveTab(undefined, signal)
   throwIfRebindAborted(signal)
   const summary = tab === undefined ? null : summarizeTab(tab)
@@ -852,6 +920,9 @@ async function rebindTabAffinityToActive(signal: AbortSignal, sessionId?: string
     cancelPendingApprovals(sessionId)
   }
   tabAffinity.rebindActive(summary, sessionId)
+  if (sessionId !== undefined) {
+    pageSessionContexts.bind(sessionId, { id: summary.tabId, ...summary })
+  }
   if (previousControlledTabId !== undefined && previousControlledTabId !== summary.tabId) {
     resetTabSnapshot(previousControlledTabId)
   }
@@ -883,7 +954,6 @@ async function pushBudgetToControlledTab(negotiated: BridgeCaps): Promise<void> 
 /** Route one tool.call frame to the user-approved controlled tab. */
 function routeToolCall(call: ToolCall): void {
   if (bridge === null) return
-  recentSession.remember(call.sessionId)
   activeToolCalls.get(call.id)?.abort()
   const controller = new AbortController()
   activeToolCalls.set(call.id, controller)
@@ -918,7 +988,7 @@ function routeToolCall(call: ToolCall): void {
           () => target.id !== undefined && tabAffinity.allowsTarget(target.id, call.sessionId),
         ))
   ).then(
-    (answer) => {
+    async (answer) => {
       // A committed browser_open_tab already rebound affinity; prefer that
       // factual success over a generic cancel that would leave the model wrong.
       if (controller.signal.aborted && !(call.name === 'browser_open_tab' && answer.ok)) {
@@ -932,11 +1002,14 @@ function routeToolCall(call: ToolCall): void {
         }
         return
       }
-      const socket = bridge
-      if (socket === null) return
       if (answer.ok) {
+        if (isNavigationCandidateTool(call.name)) await checkpointSessionPage(call.sessionId)
+        const socket = bridge
+        if (socket === null) return
         socket.send({ t: 'tool.result', id: call.id, ok: true, result: answer.result })
       } else {
+        const socket = bridge
+        if (socket === null) return
         socket.send({ t: 'tool.result', id: call.id, ok: false, error: answer.error! })
       }
     },
@@ -1010,11 +1083,11 @@ async function startBridge(): Promise<void> {
           transientEvents.clear()
         }
         broadcastStatus()
+        if (state === 'stopped') refreshPanelResumeHints()
         if (state === 'stopped' && panelPorts.size === 0) disarmBridgeKeepalive()
       },
       onFrame: (frame) => {
         if (frame.t === 'event') {
-          recentSession.noteActivity(sessionIdFromFrame(frame))
           transientEvents.ingest(frame)
           broadcastEvent(frame)
         }
@@ -1181,6 +1254,7 @@ chrome.runtime.onConnect.addListener((port) => {
         try {
           port.postMessage({ type: 'selection', selection: selections.current(registration.windowId) })
         } catch { /* port closed */ }
+        void postResumeHint(port, registration.windowId)
         break
       }
       case 'selection.clear': {
@@ -1203,17 +1277,18 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       case 'session.active': {
         const session = message as { sessionId?: unknown; isNew?: boolean }
-        recentSession.remember(session.sessionId)
-        if (typeof session.sessionId === 'string' && session.sessionId.trim() !== '') {
-          const sid = session.sessionId
-          if (session.isNew === true && tabAffinity.getSessionTab(sid) === undefined) {
-            const bind = affinityReady.then(async () => {
-              if (tabAffinity.getSessionTab(sid) !== undefined) return
+        const sid = validSessionId(session.sessionId)
+        if (sid === undefined) {
+          panelActiveSessions.delete(port)
+        } else {
+          panelActiveSessions.set(port, sid)
+          if (session.isNew === true) {
+            const bind = Promise.all([affinityReady, pageSessionContexts.ready]).then(async () => {
               const tab = await syncActiveTab()
               const summary = tab === undefined ? null : summarizeTab(tab)
               if (summary === null) throw new Error('No active tab is available to bind this session')
-              if (tabAffinity.getSessionTab(sid) !== undefined) return
-              tabAffinity.bindNewSession(sid, summary)
+              if (tabAffinity.getSessionTab(sid) === undefined) tabAffinity.bindNewSession(sid, summary)
+              pageSessionContexts.bind(sid, { id: summary.tabId, ...summary })
               resetTabSnapshot(summary.tabId)
               persistTabAffinity()
               broadcastTabAffinity()
@@ -1260,7 +1335,7 @@ chrome.runtime.onConnect.addListener((port) => {
         const request = message as { id?: unknown; sessionId?: unknown }
         if (typeof request.id !== 'string') break
         const requestId = request.id
-        const rebindSessionId = typeof request.sessionId === 'string' ? request.sessionId : undefined
+        const rebindSessionId = validSessionId(request.sessionId) ?? panelActiveSessions.get(port)
         if (tabAffinityRebinds.has(requestId)) break
         const controller = new AbortController()
         const timer = setTimeout(() => {
@@ -1307,11 +1382,8 @@ chrome.runtime.onConnect.addListener((port) => {
             port.postMessage({ type: 'approval.request', request })
             return true
           })
-          void recentSession.ready.then(() => {
-            try {
-              port.postMessage({ type: 'session.resume-hint', sessionId: recentSession.current() })
-            } catch { /* port closed */ }
-          })
+          const resumeWindowId = panelWindows.get(port)
+          if (resumeWindowId !== undefined) void postResumeHint(port, resumeWindowId)
         } catch { /* port closed */ }
         break
     }
@@ -1325,7 +1397,10 @@ chrome.runtime.onConnect.addListener((port) => {
     }
     tabAffinityRebinds.clear()
     const panelWindowId = panelWindows.get(port)
+    const panelSessionId = panelActiveSessions.get(port)
+    panelActiveSessions.delete(port)
     panelPorts.delete(port)
+    if (panelSessionId !== undefined) void checkpointSessionPage(panelSessionId)
     interactionResponses.removePort(port)
     if (panelWindowId !== undefined && !hasPanelInWindow(panelWindowId)) {
       const source = selections.source(panelWindowId)
@@ -1379,6 +1454,9 @@ chrome.tabs.onUpdated.addListener((tabId, _changeInfo, tab) => {
 chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   // The old document is gone even though Chrome transfers the tab identity.
   broadcastSelections(selections.clearTab(removedTabId))
+  void pageSessionContexts.ready.then(() => {
+    pageSessionContexts.replaceTab(removedTabId, addedTabId)
+  })
   void affinityReady.then(() => {
     // onReplaced is an identity swap (for example prerender activation), not
     // a close or user-visible switch. Transfer IDs synchronously before any
@@ -1402,6 +1480,9 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   broadcastSelections(selections.clearTab(tabId))
+  void pageSessionContexts.ready.then(() => {
+    pageSessionContexts.removeTab(tabId)
+  })
   void affinityReady.then(() => {
     const affectedSessions = tabAffinity.sessionIdsForTab(tabId)
     if (!tabAffinity.removeTab(tabId)) return

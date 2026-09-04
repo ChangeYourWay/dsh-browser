@@ -1,6 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { dispatchToolCall, type ToolAnswer, type ToolCall } from '../src/background/tools.ts'
+import {
+  dispatchToolCall,
+  isNavigationCandidateTool,
+  type ToolAnswer,
+  type ToolCall,
+} from '../src/background/tools.ts'
 
 const CALL: ToolCall = { id: 'tool-1', name: 'browser_snapshot', args: {} }
 const OK: ToolAnswer = { ok: true, result: { text: 'page' } }
@@ -63,6 +68,16 @@ function mockChrome(options: {
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+})
+
+describe('isNavigationCandidateTool', () => {
+  it('classifies only tools that may change the page checkpoint', () => {
+    expect(isNavigationCandidateTool('browser_click')).toBe(true)
+    expect(isNavigationCandidateTool('browser_navigate')).toBe(true)
+    expect(isNavigationCandidateTool('browser_open_tab')).toBe(true)
+    expect(isNavigationCandidateTool('browser_snapshot')).toBe(false)
+    expect(isNavigationCandidateTool('browser_type')).toBe(false)
+  })
 })
 
 describe('dispatchToolCall', () => {
