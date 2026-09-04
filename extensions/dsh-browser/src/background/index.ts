@@ -1077,6 +1077,7 @@ function routeToolCall(call: ToolCall): void {
         ))
   ).then(
     async (answer) => {
+      if (activeToolCalls.get(call.id) !== activeCall) return
       // A committed browser_open_tab already rebound affinity; prefer that
       // factual success over a generic cancel that would leave the model wrong.
       if (controller.signal.aborted && !(call.name === 'browser_open_tab' && answer.ok)) {
@@ -1102,6 +1103,7 @@ function routeToolCall(call: ToolCall): void {
       }
     },
     (error: unknown) => {
+      if (activeToolCalls.get(call.id) !== activeCall) return
       if (controller.signal.aborted) {
         if (activeToolCalls.get(call.id) === activeCall) {
           bridge?.send({

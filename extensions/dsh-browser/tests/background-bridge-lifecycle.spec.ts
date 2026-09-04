@@ -368,4 +368,60 @@ describe('background bridge lifecycle', () => {
     })
     expect(events).toEqual(['closed', 'saved'])
   })
+
+  it('does not deliver a disconnected bridge call result to a replacement connection', async () => {
+    let finishClose!: () => void
+    const close = new Promise<void>((resolve) => { finishClose = resolve })
+    const chromeMock = mockChrome({
+      localGet: async () => ({
+        dshSettings: {
+          bridgeUrl: 'wss://bridge.example/ext/bridge',
+          unrestrictedBrowserAccess: true,
+        },
+      }),
+      tabRemove: async () => { await close },
+    })
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    const originalSocket = FakeWebSocket.instances[0]!
+    originalSocket.open()
+    await Promise.resolve()
+    originalSocket.receive({
+      t: 'hello.ok',
+      caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+    })
+    await Promise.resolve()
+    originalSocket.receive({
+      t: 'tool.call',
+      id: 'old-close',
+      name: 'browser_close_tab',
+      args: { tabId: 1 },
+      expiresAt: Date.now() + 10_000,
+    })
+    await vi.waitFor(() => { expect(chromeMock.tabs.remove).toHaveBeenCalledWith(1) })
+
+    panel.onMessage.emit({
+      type: 'settings',
+      settings: { approvalNotifications: false },
+    })
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(2) })
+    const replacementSocket = FakeWebSocket.instances[1]!
+    replacementSocket.open()
+    await Promise.resolve()
+    replacementSocket.receive({
+      t: 'hello.ok',
+      caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+    })
+    await Promise.resolve()
+
+    finishClose()
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+
+    expect(originalSocket.sent).not.toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'old-close' }))
+    expect(replacementSocket.sent).not.toContainEqual(expect.objectContaining({ t: 'tool.result', id: 'old-close' }))
+  })
 })
