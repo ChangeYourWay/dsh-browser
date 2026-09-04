@@ -87,7 +87,7 @@ export interface Settings {
   trustedActionOrigins: string[]
   /** Show an OS notification when no side panel can display an approval. */
   approvalNotifications: boolean
-  /** Restore the last active browser conversation when the panel reopens. */
+  /** Restore the current tab and page path's conversation when the panel reopens. */
   autoResumeSession: boolean
 }
 
