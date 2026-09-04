@@ -238,7 +238,11 @@ async function loadSettings(): Promise<Settings> {
 }
 
 async function persistSettings(next: Partial<Settings>): Promise<void> {
-  settings = normalizeSettings({ ...settings, ...next })
+  const updated = normalizeSettings({ ...settings, ...next })
+  if (settings.unrestrictedBrowserAccess && !updated.unrestrictedBrowserAccess) {
+    cancelActiveToolCallsWithResults()
+  }
+  settings = updated
   await chrome.storage.local.set({ [STORAGE_KEY]: settings })
 }
 
@@ -1095,6 +1099,19 @@ function routeToolCall(call: ToolCall): void {
 
 function cancelToolCall(id: string): void {
   activeToolCalls.get(id)?.abort()
+}
+
+function cancelActiveToolCallsWithResults(): void {
+  for (const [id, controller] of activeToolCalls) {
+    controller.abort()
+    bridge?.send({
+      t: 'tool.result',
+      id,
+      ok: false,
+      error: { code: 'action-failed', message: 'Tool call was cancelled' },
+    })
+  }
+  activeToolCalls.clear()
 }
 
 function cancelAllToolCalls(): void {

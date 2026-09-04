@@ -9,13 +9,16 @@ class FakeWebSocket extends EventTarget {
   static instances: FakeWebSocket[] = []
 
   readyState = FakeWebSocket.CONNECTING
+  readonly sent: unknown[] = []
 
   constructor(readonly url: string) {
     super()
     FakeWebSocket.instances.push(this)
   }
 
-  send(): void {}
+  send(value: string): void {
+    this.sent.push(JSON.parse(value))
+  }
 
   open(): void {
     this.readyState = FakeWebSocket.OPEN
@@ -54,7 +57,9 @@ function panelPort() {
 }
 
 function mockChrome(options: {
+  localGet?: () => Promise<Record<string, unknown>>
   localSet?: (items: Record<string, unknown>) => Promise<void>
+  tabGet?: (tabId: number) => Promise<chrome.tabs.Tab>
 } = {}) {
   const onConnect = chromeEvent<[chrome.runtime.Port]>()
   const onAlarm = chromeEvent<[chrome.alarms.Alarm]>()
@@ -82,7 +87,7 @@ function mockChrome(options: {
     },
     storage: {
       local: {
-        get: vi.fn(async () => ({})),
+        get: vi.fn(options.localGet ?? (async () => ({}))),
         set: vi.fn(options.localSet ?? (async () => {})),
       },
       session: {
@@ -92,8 +97,9 @@ function mockChrome(options: {
       },
     },
     tabs: {
-      get: vi.fn(async (tabId: number) => ({ id: tabId, windowId: 1, title: 'Tab', url: 'https://example.com/' })),
+      get: vi.fn(options.tabGet ?? (async (tabId: number) => ({ id: tabId, windowId: 1, title: 'Tab', url: 'https://example.com/' } as chrome.tabs.Tab))),
       query: vi.fn(async () => [{ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' }]),
+      remove: vi.fn(async () => {}),
       sendMessage: vi.fn(async () => {}),
       onActivated: chromeEvent<[{ tabId: number; windowId: number }]>(),
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
@@ -109,7 +115,7 @@ function mockChrome(options: {
       onRemoved: chromeEvent<[number]>(),
     },
   } as unknown as typeof chrome)
-  return { alarms, onConnect }
+  return { alarms, onConnect, tabs: chrome.tabs }
 }
 
 afterEach(() => {
@@ -229,5 +235,62 @@ describe('background bridge lifecycle', () => {
     chromeMock.onConnect.emit(reopened.port)
     await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(2) })
     expect(FakeWebSocket.instances[1]!.url).toBe('ws://127.0.0.1:3081/ext/bridge')
+  })
+
+  it('cancels in-flight unrestricted calls before persisting revocation', async () => {
+    let finishTabLookup!: (tab: chrome.tabs.Tab) => void
+    const tabLookup = new Promise<chrome.tabs.Tab>((resolve) => { finishTabLookup = resolve })
+    const chromeMock = mockChrome({
+      localGet: async () => ({
+        dshSettings: {
+          bridgeUrl: 'wss://bridge.example/ext/bridge',
+          unrestrictedBrowserAccess: true,
+        },
+      }),
+      tabGet: async () => await tabLookup,
+    })
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+    await Promise.resolve()
+    socket.receive({
+      t: 'hello.ok',
+      caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+    })
+    await Promise.resolve()
+    socket.receive({
+      t: 'tool.call',
+      id: 'close-in-flight',
+      name: 'browser_close_tab',
+      args: { tabId: 1 },
+      expiresAt: Date.now() + 10_000,
+    })
+    await vi.waitFor(() => { expect(chromeMock.tabs.get).toHaveBeenCalledWith(1) })
+
+    panel.onMessage.emit({
+      type: 'settings',
+      settings: { unrestrictedBrowserAccess: false },
+    })
+    await vi.waitFor(() => {
+      expect(chrome.storage.local.set).toHaveBeenCalledWith(expect.objectContaining({
+        dshSettings: expect.objectContaining({ unrestrictedBrowserAccess: false }),
+      }))
+    })
+    finishTabLookup({ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' } as chrome.tabs.Tab)
+    await vi.waitFor(() => {
+      expect(socket.sent).toContainEqual({
+        t: 'tool.result',
+        id: 'close-in-flight',
+        ok: false,
+        error: { code: 'action-failed', message: 'Tool call was cancelled' },
+      })
+    })
+
+    expect(chromeMock.tabs.remove).not.toHaveBeenCalled()
   })
 })
