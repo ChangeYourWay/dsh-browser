@@ -134,7 +134,10 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
     const live = events.next()
     await vi.waitFor(() => { expect(open).toHaveBeenCalledWith('$events', { args: {} }, expect.any(AbortSignal)) })
 
-    await expect(api.call(call('session.history', { sessionId: 'session-1' }))).resolves.toEqual({
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      maxMessages: 2,
+    }))).resolves.toEqual({
       ok: true,
       value: {
         events: [
@@ -174,10 +177,65 @@ describe('dsh 0.1.2 Remote Host adapter', () => {
       }),
     })
     expect(open).toHaveBeenCalledWith('session/follow', {
-      args: { request: { address: { kind: 'session', sessionId: 'session-1' } } },
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: 'session-1' },
+          maxMessages: 2,
+        },
+      },
     }, expect.any(AbortSignal))
     abort.abort()
     await events.return?.()
+  })
+
+  it('forwards tail-page size through a one-shot session/follow snapshot', async () => {
+    const { api, open } = harness({
+      open: async (endpoint) => {
+        if (endpoint !== 'session/follow') throw new Error(endpoint)
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: 'snapshot', cursor: -1, records: [], hasMore: false }
+          },
+        }
+      },
+    })
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-one-shot',
+      maxMessages: 12,
+    }))).resolves.toEqual({
+      ok: true,
+      value: { events: [], hasMore: false },
+    })
+    expect(open).toHaveBeenCalledWith('session/follow', {
+      args: {
+        request: {
+          address: { kind: 'session', sessionId: 'session-one-shot' },
+          maxMessages: 12,
+        },
+      },
+    }, expect.any(AbortSignal))
+  })
+
+  it('rejects invalid history pagination before calling the Host', async () => {
+    const { api, invoke, open } = harness()
+
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      beforeSeq: -1,
+    }))).resolves.toEqual({
+      ok: false,
+      error: { code: 'bad-request', message: 'beforeSeq must be a non-negative safe integer', details: {} },
+    })
+    await expect(api.call(call('session.history', {
+      sessionId: 'session-1',
+      maxMessages: 0,
+    }))).resolves.toEqual({
+      ok: false,
+      error: { code: 'bad-request', message: 'maxMessages must be a positive safe integer', details: {} },
+    })
+    expect(open).not.toHaveBeenCalled()
+    expect(invoke).not.toHaveBeenCalled()
   })
 
   it('pages older history with a Host-legal throughSeq, never MAX_SAFE_INTEGER', async () => {

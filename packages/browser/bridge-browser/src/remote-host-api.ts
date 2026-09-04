@@ -150,9 +150,15 @@ class RemoteHostApi implements BrowserHostApi {
   private async sessionHistory(call: HostRpcCall): Promise<HostRpcResult> {
     const sessionId = sessionIdOf(call.payload)
     if (sessionId === undefined) return badRequest('session.history requires a non-empty sessionId')
+    let beforeSeq: number | undefined
+    let maxMessages: number | undefined
     try {
-      const beforeSeq = optionalNonNegativeInteger(call.payload, 'beforeSeq')
-      const maxMessages = optionalPositiveInteger(call.payload, 'maxMessages')
+      beforeSeq = optionalNonNegativeInteger(call.payload, 'beforeSeq')
+      maxMessages = optionalPositiveInteger(call.payload, 'maxMessages')
+    } catch (error: unknown) {
+      return badRequest(error instanceof Error ? error.message : 'session.history pagination is invalid')
+    }
+    try {
       if (beforeSeq !== undefined) {
         const throughSeq = await this.historyThroughSeq(sessionId, call.signal)
         const page = await this.gateway.invoke({
@@ -172,8 +178,8 @@ class RemoteHostApi implements BrowserHostApi {
       }
 
       const snapshot = this.activeEvents === undefined
-        ? await oneShotSessionSnapshot(this.gateway, sessionId, call.signal)
-        : await this.activeEvents.openSessionHistory(sessionId, call.signal)
+        ? await oneShotSessionSnapshot(this.gateway, sessionId, call.signal, maxMessages)
+        : await this.activeEvents.openSessionHistory(sessionId, call.signal, maxMessages)
       this.noteHistoryCursor(sessionId, snapshot.cursor)
       return { ok: true, value: historyValue(snapshot) }
     } catch (error: unknown) {
@@ -326,8 +332,12 @@ class EventGeneration {
     return this.queue.iterate(this.signal)
   }
 
-  async openSessionHistory(sessionId: string, callSignal: AbortSignal): Promise<SessionSnapshot> {
-    return this.openSessionFollow(sessionId, callSignal)
+  async openSessionHistory(
+    sessionId: string,
+    callSignal: AbortSignal,
+    maxMessages?: number,
+  ): Promise<SessionSnapshot> {
+    return this.openSessionFollow(sessionId, callSignal, maxMessages)
   }
 
   async ensureSessionFollow(sessionId: string, callSignal: AbortSignal): Promise<void> {
@@ -363,6 +373,7 @@ class EventGeneration {
   private async openSessionFollow(
     sessionId: string,
     callSignal: AbortSignal,
+    maxMessages?: number,
   ): Promise<SessionSnapshot> {
     const revision = ++this.followRevision
     this.followAbort?.abort(new Error('browser bridge Session follower replaced'))
@@ -373,7 +384,14 @@ class EventGeneration {
     try {
       const source = await this.gateway.wireStream.open(
         'session/follow',
-        { args: { request: { address: { kind: 'session', sessionId } } } },
+        {
+          args: {
+            request: {
+              address: { kind: 'session', sessionId },
+              ...(maxMessages === undefined ? {} : { maxMessages }),
+            },
+          },
+        },
         signal,
       )
       const iterator = source[Symbol.asyncIterator]()
@@ -634,12 +652,20 @@ async function oneShotSessionSnapshot(
   gateway: TypertGatewayLike,
   sessionId: string,
   outerSignal: AbortSignal,
+  maxMessages?: number,
 ): Promise<SessionSnapshot> {
   const controller = new AbortController()
   const signal = AbortSignal.any([outerSignal, controller.signal])
   const source = await gateway.wireStream.open(
     'session/follow',
-    { args: { request: { address: { kind: 'session', sessionId } } } },
+    {
+      args: {
+        request: {
+          address: { kind: 'session', sessionId },
+          ...(maxMessages === undefined ? {} : { maxMessages }),
+        },
+      },
+    },
     signal,
   )
   const iterator = source[Symbol.asyncIterator]()
@@ -689,7 +715,7 @@ function optionalNonNegativeInteger(
 ): number | undefined {
   if (!isRecord(payload) || !(key in payload) || payload[key] === undefined) return undefined
   const value = payload[key]
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || Object.is(value, -0)) {
     throw new TypeError(`${key} must be a non-negative safe integer`)
   }
   return value as number
