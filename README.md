@@ -11,7 +11,7 @@ Connect [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) to t
 Browser operation remains text-only: pages become structured text with a numbered inventory of interactive elements, and the model addresses those elements by number. dsh 0.1.2 multimodal chat is separate from that page channel—the side panel accepts PNG, JPEG, WebP, and GIF attachments when the host advertises image support, while browser tools still never capture screenshots.
 
 > [!IMPORTANT]
-> The migration branch targets dsh 0.1.2 only; it does not carry a 0.1.1 compatibility path. The repository runtime pin will move atomically when the 0.1.2 packages are available on npm.
+> The workspace uses dsh 0.1.2-rc.1 as its primary runtime and temporarily supports 0.1.1-rc.2 through an ApiProxy compatibility adapter. Earlier releases are not supported.
 
 ## Quick install
 
