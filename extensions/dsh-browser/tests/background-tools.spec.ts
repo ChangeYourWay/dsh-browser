@@ -180,11 +180,16 @@ describe('dispatchToolCall', () => {
 
   it('uses browser-level navigation, history, and reload on protected pages', async () => {
     const chromeMock = mockChrome({ tab: { id: 8, url: 'chrome://newtab/' } })
+    const commitAction = vi.fn()
     await expect(dispatchToolCall(
       { id: 'navigate-protected', name: 'browser_navigate', args: { url: 'https://example.com/path' } },
       'auto',
       undefined,
       async () => 'approved',
+      undefined,
+      undefined,
+      undefined,
+      { unrestrictedAccess: false, commitAction },
     )).resolves.toMatchObject({ ok: true })
     expect(chromeMock.update).toHaveBeenCalledWith(8, { url: 'https://example.com/path' })
 
@@ -198,9 +203,14 @@ describe('dispatchToolCall', () => {
         'auto',
         undefined,
         async () => 'approved',
+        undefined,
+        undefined,
+        undefined,
+        { unrestrictedAccess: false, commitAction },
       )).resolves.toMatchObject({ ok: true })
       expect(operation).toHaveBeenCalledWith(8)
     }
+    expect(commitAction).toHaveBeenCalledTimes(4)
     expect(chromeMock.sendMessage).not.toHaveBeenCalled()
   })
 
@@ -227,7 +237,8 @@ describe('dispatchToolCall', () => {
     const chromeMock = mockChrome({ tabs })
     const authorize = vi.fn(async () => 'approved' as const)
     const followTab = vi.fn(async () => undefined)
-    const context = { unrestrictedAccess: false, controlledTabId: 11, followTab }
+    const commitAction = vi.fn()
+    const context = { unrestrictedAccess: false, controlledTabId: 11, followTab, commitAction }
 
     const listed = await dispatchToolCall(
       { id: 'list-tabs', name: 'browser_list_tabs', args: {} },
@@ -250,6 +261,7 @@ describe('dispatchToolCall', () => {
     )).resolves.toMatchObject({ ok: true })
     expect(chromeMock.get).toHaveBeenCalledTimes(4)
     expect(chromeMock.remove).toHaveBeenCalledWith(12)
+    expect(commitAction).toHaveBeenCalledTimes(2)
   })
 
   it('skips sharing blocks and approval prompts only in unrestricted mode', async () => {
@@ -427,9 +439,20 @@ describe('dispatchToolCall', () => {
     await dispatchToolCall(CALL, 'auto')
     chromeMock.sendMessage.mockClear()
 
-    const answer = await dispatchToolCall(call, 'ask', undefined, async () => 'approved')
+    const commitAction = vi.fn()
+    const answer = await dispatchToolCall(
+      call,
+      'ask',
+      undefined,
+      async () => 'approved',
+      undefined,
+      undefined,
+      undefined,
+      { unrestrictedAccess: false, commitAction },
+    )
 
     expect(answer).toEqual({ ok: true, result: { text: 'Clicked [2].' } })
+    expect(commitAction).toHaveBeenCalledOnce()
     expect(chromeMock.sendMessage).toHaveBeenCalledWith(34, {
       type: 'DSH_ACTION',
       action: 'browser_click',
@@ -744,6 +767,7 @@ describe('dispatchOpenTab', () => {
     })
 
     const bindCreatedTab = vi.fn(() => true)
+    const commitAction = vi.fn()
     const open = dispatchOpenTab(
       { id: 'open-1', name: 'browser_open_tab', args: { url: 'https://docs.example/' } },
       9,
@@ -753,6 +777,7 @@ describe('dispatchOpenTab', () => {
       undefined,
       bindCreatedTab,
       () => true,
+      commitAction,
     )
     await vi.waitFor(() => { expect(runtimeListeners.size).toBe(1) })
     expect(create).toHaveBeenCalledWith({ active: true, windowId: 9 })
@@ -777,6 +802,7 @@ describe('dispatchOpenTab', () => {
     }
     const answer = await open
     expect(bindCreatedTab).toHaveBeenCalledOnce()
+    expect(commitAction).toHaveBeenCalledOnce()
     expect(remove).not.toHaveBeenCalled()
     expect(answer.ok).toBe(true)
     expect((answer.result as { text: string }).text).toContain('Opened a new tab')

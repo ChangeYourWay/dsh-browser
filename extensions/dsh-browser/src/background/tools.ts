@@ -71,6 +71,16 @@ const TAB_NATIVE_TOOLS = new Set([
   'browser_forward',
   'browser_reload',
 ])
+const STATE_CHANGING_PAGE_TOOLS = new Set([
+  'browser_click',
+  'browser_type',
+  'browser_press',
+  'browser_scroll',
+  'browser_navigate',
+  'browser_back',
+  'browser_forward',
+  'browser_reload',
+])
 /** Tools that operate on the browser tab collection rather than one page document. */
 export const TAB_MANAGEMENT_TOOL_NAMES = new Set([
   'browser_list_tabs',
@@ -104,6 +114,8 @@ export interface TabManagementContext {
   controlledTabId?: number
   /** Rebind subsequent tools to one existing tab without activating it. */
   followTab?: (tab: chrome.tabs.Tab) => void | Promise<void>
+  /** Mark the point after which a state-changing operation cannot be withdrawn. */
+  commitAction?: () => void
 }
 
 function isToolAnswer(value: unknown): value is ToolAnswer {
@@ -186,6 +198,7 @@ async function dispatchTabNativeTool(
   budget: ContentBudget,
   signal?: AbortSignal,
   targetStillAllowed?: () => boolean,
+  commitAction?: () => void,
 ): Promise<ToolAnswer | undefined> {
   if (call.name === 'browser_snapshot') return tabMetadataSnapshot(tabId, windowId, tabTitle, tabUrl, budget.maxChars)
   if (!TAB_NATIVE_TOOLS.has(call.name)) return undefined
@@ -201,19 +214,23 @@ async function dispatchTabNativeTool(
         if (requested === undefined) {
           return { ok: false, error: { code: 'action-failed', message: 'url must be a complete http or https URL.' } }
         }
+        commitAction?.()
         operation = chrome.tabs.update(tabId, { url: requested.href })
         text = `Navigating to ${requested.href}. Call browser_snapshot again after the page loads.`
         break
       }
       case 'browser_back':
+        commitAction?.()
         operation = chrome.tabs.goBack(tabId)
         text = 'Navigating through browser history. Call browser_snapshot again after the page loads.'
         break
       case 'browser_forward':
+        commitAction?.()
         operation = chrome.tabs.goForward(tabId)
         text = 'Navigating through browser history. Call browser_snapshot again after the page loads.'
         break
       case 'browser_reload':
+        commitAction?.()
         operation = chrome.tabs.reload(tabId)
         text = 'The page is reloading. Call browser_snapshot again after it loads.'
         break
@@ -410,6 +427,7 @@ async function dispatchOnce(
   signal?: AbortSignal,
   targetStillAllowed?: () => boolean,
   includeActionDelta: boolean = false,
+  commitAction?: () => void,
 ): Promise<ToolAnswer> {
   if (isCancelled(call, signal)) return cancelled()
   if (targetStillAllowed?.() === false) return targetChanged()
@@ -432,6 +450,7 @@ async function dispatchOnce(
     : undefined
   let response: unknown
   try {
+    if (STATE_CHANGING_PAGE_TOOLS.has(call.name)) commitAction?.()
     response = await sendAction(
       tabId,
       call,
@@ -600,6 +619,7 @@ async function dispatchTabManagementTool(
 
   if (call.name === 'browser_follow_tab') {
     if (context.followTab === undefined) return unavailable('The browser could not bind the selected tab in this session.')
+    context.commitAction?.()
     await context.followTab(current)
     return {
       ok: true,
@@ -608,6 +628,7 @@ async function dispatchTabManagementTool(
   }
   if (call.name === 'browser_close_tab') {
     try {
+      context.commitAction?.()
       await chrome.tabs.remove(tabId)
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : String(error)
@@ -704,7 +725,7 @@ export async function dispatchToolCall(
     if (refreshedTargetError !== undefined) return refreshedTargetError
   }
   if (!isInjectablePage(tab.url)) {
-    return await dispatchTabNativeTool(tab.id, tab.url, tab.title, tab.windowId, call, effectiveBudget, signal, targetStillAllowed)
+    return await dispatchTabNativeTool(tab.id, tab.url, tab.title, tab.windowId, call, effectiveBudget, signal, targetStillAllowed, tabManagement.commitAction)
       ?? unavailable('The current page DOM is protected by the browser.')
   }
   try {
@@ -716,6 +737,7 @@ export async function dispatchToolCall(
       signal,
       targetStillAllowed,
       tabManagement.unrestrictedAccess || sharePageContent === 'auto',
+      tabManagement.commitAction,
     )
   } catch {
     if (isCancelled(call, signal)) return cancelled()
@@ -725,7 +747,7 @@ export async function dispatchToolCall(
     try {
       await injectContentScript(tab.id)
     } catch {
-      return await dispatchTabNativeTool(tab.id, tab.url, tab.title, tab.windowId, call, effectiveBudget, signal, targetStillAllowed)
+      return await dispatchTabNativeTool(tab.id, tab.url, tab.title, tab.windowId, call, effectiveBudget, signal, targetStillAllowed, tabManagement.commitAction)
         ?? unavailable('The content script could not be loaded on this page. Its DOM does not support browser operations.')
     }
     try {
@@ -752,6 +774,7 @@ export async function dispatchToolCall(
         signal,
         targetStillAllowed,
         tabManagement.unrestrictedAccess || sharePageContent === 'auto',
+        tabManagement.commitAction,
       )
     } catch {
       return unavailable('The content script did not answer after it was loaded. Call browser_snapshot again before retrying.')
@@ -833,6 +856,7 @@ export async function dispatchOpenTab(
   signal: AbortSignal | undefined,
   bindCreatedTab: (tab: chrome.tabs.Tab) => boolean,
   targetStillAllowed: (tabId: number) => boolean,
+  commitAction?: () => void,
 ): Promise<ToolAnswer> {
   if (isCancelled(call, signal)) return cancelled()
   const parsed = parseHttpUrl(call.args.url)
@@ -889,6 +913,7 @@ export async function dispatchOpenTab(
     await removeCreatedTab(tabId)
     return cancelled()
   }
+  commitAction?.()
   if (!bindCreatedTab(created.id === undefined ? { ...created, id: tabId } : created)) {
     await removeCreatedTab(tabId)
     return {

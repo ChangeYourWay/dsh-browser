@@ -60,6 +60,7 @@ function mockChrome(options: {
   localGet?: () => Promise<Record<string, unknown>>
   localSet?: (items: Record<string, unknown>) => Promise<void>
   tabGet?: (tabId: number) => Promise<chrome.tabs.Tab>
+  tabRemove?: (tabId: number) => Promise<void>
 } = {}) {
   const onConnect = chromeEvent<[chrome.runtime.Port]>()
   const onAlarm = chromeEvent<[chrome.alarms.Alarm]>()
@@ -99,7 +100,7 @@ function mockChrome(options: {
     tabs: {
       get: vi.fn(options.tabGet ?? (async (tabId: number) => ({ id: tabId, windowId: 1, title: 'Tab', url: 'https://example.com/' } as chrome.tabs.Tab))),
       query: vi.fn(async () => [{ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' }]),
-      remove: vi.fn(async () => {}),
+      remove: vi.fn(options.tabRemove ?? (async () => {})),
       sendMessage: vi.fn(async () => {}),
       onActivated: chromeEvent<[{ tabId: number; windowId: number }]>(),
       onUpdated: chromeEvent<[number, chrome.tabs.TabChangeInfo, chrome.tabs.Tab]>(),
@@ -276,11 +277,15 @@ describe('background bridge lifecycle', () => {
       type: 'settings',
       settings: { unrestrictedBrowserAccess: false },
     })
-    await vi.waitFor(() => {
-      expect(chrome.storage.local.set).toHaveBeenCalledWith(expect.objectContaining({
-        dshSettings: expect.objectContaining({ unrestrictedBrowserAccess: false }),
-      }))
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(chrome.storage.local.set).not.toHaveBeenCalled()
+    panel.onMessage.emit({
+      type: 'settings',
+      settings: { approvalNotifications: false },
     })
+    await new Promise((resolve) => { setTimeout(resolve, 0) })
+    expect(chrome.storage.local.set).not.toHaveBeenCalled()
+
     finishTabLookup({ id: 1, windowId: 1, title: 'Tab', url: 'https://example.com/' } as chrome.tabs.Tab)
     await vi.waitFor(() => {
       expect(socket.sent).toContainEqual({
@@ -289,8 +294,78 @@ describe('background bridge lifecycle', () => {
         ok: false,
         error: { code: 'action-failed', message: 'Tool call was cancelled' },
       })
+      expect(chrome.storage.local.set).toHaveBeenCalledWith(expect.objectContaining({
+        dshSettings: expect.objectContaining({ unrestrictedBrowserAccess: false }),
+      }))
     })
+    await vi.waitFor(() => { expect(chrome.storage.local.set).toHaveBeenCalledTimes(2) })
 
     expect(chromeMock.tabs.remove).not.toHaveBeenCalled()
+  })
+
+  it('settles a committed unrestricted action before persisting revocation', async () => {
+    const events: string[] = []
+    let finishClose!: () => void
+    const close = new Promise<void>((resolve) => { finishClose = resolve })
+    const chromeMock = mockChrome({
+      localGet: async () => ({
+        dshSettings: {
+          bridgeUrl: 'wss://bridge.example/ext/bridge',
+          unrestrictedBrowserAccess: true,
+        },
+      }),
+      localSet: async () => { events.push('saved') },
+      tabRemove: async () => {
+        await close
+        events.push('closed')
+      },
+    })
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+    await import('../src/background/index.ts')
+
+    const panel = panelPort()
+    chromeMock.onConnect.emit(panel.port)
+    await vi.waitFor(() => { expect(FakeWebSocket.instances).toHaveLength(1) })
+    const socket = FakeWebSocket.instances[0]!
+    socket.open()
+    await Promise.resolve()
+    socket.receive({
+      t: 'hello.ok',
+      caps: { textOnly: true, snapshotMaxChars: 32_000, maxInteractiveItems: 60 },
+    })
+    await Promise.resolve()
+    socket.receive({
+      t: 'tool.call',
+      id: 'close-committed',
+      name: 'browser_close_tab',
+      args: { tabId: 1 },
+      expiresAt: Date.now() + 10_000,
+    })
+    await vi.waitFor(() => { expect(chromeMock.tabs.remove).toHaveBeenCalledWith(1) })
+
+    panel.onMessage.emit({
+      type: 'settings',
+      settings: { unrestrictedBrowserAccess: false },
+    })
+    await Promise.resolve()
+    expect(chrome.storage.local.set).not.toHaveBeenCalled()
+    expect(socket.sent).not.toContainEqual(expect.objectContaining({
+      t: 'tool.result',
+      id: 'close-committed',
+      ok: false,
+    }))
+
+    finishClose()
+    await vi.waitFor(() => {
+      expect(socket.sent).toContainEqual(expect.objectContaining({
+        t: 'tool.result',
+        id: 'close-committed',
+        ok: true,
+      }))
+      expect(chrome.storage.local.set).toHaveBeenCalledWith(expect.objectContaining({
+        dshSettings: expect.objectContaining({ unrestrictedBrowserAccess: false }),
+      }))
+    })
+    expect(events).toEqual(['closed', 'saved'])
   })
 })

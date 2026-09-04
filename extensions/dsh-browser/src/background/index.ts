@@ -160,6 +160,7 @@ type StoredTabAffinity =
   | { lost: true; sessionTabs?: Record<string, AffinityTab>; focusedSessionId?: string }
 
 let settings: Settings = { ...SETTINGS_DEFAULTS }
+let unrestrictedRevocation: Promise<void> | undefined
 let caps: BridgeCaps | null = null
 let bridge: BridgeClient | null = null
 let rpc: ReturnType<typeof createRpc> | null = null
@@ -181,8 +182,15 @@ const pageSessionContexts = new PageSessionContextTracker({
 void chrome.storage.session.remove(LEGACY_RECENT_SESSION_STORAGE_KEY).catch(() => {})
 /** Ephemeral allowlist: cleared when the last side panel closes or this worker restarts. */
 const sessionTrustedActionOrigins = new Set<string>()
-/** Tool calls that can still be withdrawn by a bridge `tool.cancel` frame. */
-const activeToolCalls = new Map<string, AbortController>()
+/** Tool calls that are either withdrawable or completing an already-dispatched action. */
+interface ActiveToolCall {
+  controller: AbortController
+  committed: boolean
+  settled: Promise<void>
+  settle: () => void
+}
+
+const activeToolCalls = new Map<string, ActiveToolCall>()
 let lastPersistedAffinity: string | undefined
 let affinityPersistence = Promise.resolve()
 /** Per-session snapshot refreshes preserve prompt ordering without cross-session cancellation. */
@@ -239,10 +247,19 @@ async function loadSettings(): Promise<Settings> {
 
 async function persistSettings(next: Partial<Settings>): Promise<void> {
   const updated = normalizeSettings({ ...settings, ...next })
-  if (settings.unrestrictedBrowserAccess && !updated.unrestrictedBrowserAccess) {
-    cancelActiveToolCallsWithResults()
-  }
+  const revokesUnrestrictedAccess = settings.unrestrictedBrowserAccess && !updated.unrestrictedBrowserAccess
   settings = updated
+  if (revokesUnrestrictedAccess) {
+    const revocation = revokeUnrestrictedAccess()
+    unrestrictedRevocation = revocation
+    try {
+      await revocation
+    } finally {
+      if (unrestrictedRevocation === revocation) unrestrictedRevocation = undefined
+    }
+  } else if (!updated.unrestrictedBrowserAccess && unrestrictedRevocation !== undefined) {
+    await unrestrictedRevocation
+  }
   await chrome.storage.local.set({ [STORAGE_KEY]: settings })
 }
 
@@ -982,12 +999,22 @@ async function pushBudgetToControlledTab(negotiated: BridgeCaps): Promise<void> 
 /** Route one tool.call frame to the user-approved controlled tab. */
 function routeToolCall(call: ToolCall): void {
   if (bridge === null) return
-  activeToolCalls.get(call.id)?.abort()
+  activeToolCalls.get(call.id)?.controller.abort()
   const controller = new AbortController()
-  activeToolCalls.set(call.id, controller)
+  let settle!: () => void
+  const activeCall: ActiveToolCall = {
+    controller,
+    committed: false,
+    settled: new Promise<void>((resolve) => { settle = resolve }),
+    settle: () => { settle() },
+  }
+  activeToolCalls.set(call.id, activeCall)
+  const commitAction = (): void => { activeCall.committed = true }
   const expiryTimer = call.expiresAt === undefined
     ? undefined
-    : setTimeout(() => { controller.abort() }, Math.max(0, call.expiresAt - Date.now()))
+    : setTimeout(() => {
+        if (!activeCall.committed) controller.abort()
+      }, Math.max(0, call.expiresAt - Date.now()))
   const budget = caps === null
     ? undefined
     : { maxItems: caps.maxInteractiveItems, maxChars: caps.snapshotMaxChars }
@@ -1016,6 +1043,7 @@ function routeToolCall(call: ToolCall): void {
         unrestrictedAccess: settings.unrestrictedBrowserAccess,
         ...(controlledTabId === undefined ? {} : { controlledTabId }),
         followTab: (tab) => followModelSelectedTab(tab, call.sessionId),
+        commitAction,
       },
     )
   }
@@ -1033,6 +1061,7 @@ function routeToolCall(call: ToolCall): void {
           controller.signal,
           (tab) => bindOpenedTab(tab, call.sessionId),
           (tabId) => tabAffinity.allowsTarget(tabId, call.sessionId),
+          commitAction,
         ))
     : resolveToolTab(call.sessionId).then((target) => 'ok' in target
       ? target
@@ -1044,14 +1073,14 @@ function routeToolCall(call: ToolCall): void {
           controller.signal,
           target,
           () => target.id !== undefined && tabAffinity.allowsTarget(target.id, call.sessionId),
-          { unrestrictedAccess: settings.unrestrictedBrowserAccess },
+          { unrestrictedAccess: settings.unrestrictedBrowserAccess, commitAction },
         ))
   ).then(
     async (answer) => {
       // A committed browser_open_tab already rebound affinity; prefer that
       // factual success over a generic cancel that would leave the model wrong.
       if (controller.signal.aborted && !(call.name === 'browser_open_tab' && answer.ok)) {
-        if (activeToolCalls.get(call.id) === controller) {
+        if (activeToolCalls.get(call.id) === activeCall) {
           bridge?.send({
             t: 'tool.result',
             id: call.id,
@@ -1074,7 +1103,7 @@ function routeToolCall(call: ToolCall): void {
     },
     (error: unknown) => {
       if (controller.signal.aborted) {
-        if (activeToolCalls.get(call.id) === controller) {
+        if (activeToolCalls.get(call.id) === activeCall) {
           bridge?.send({
             t: 'tool.result',
             id: call.id,
@@ -1093,29 +1122,28 @@ function routeToolCall(call: ToolCall): void {
     },
   ).finally(() => {
     if (expiryTimer !== undefined) clearTimeout(expiryTimer)
-    if (activeToolCalls.get(call.id) === controller) activeToolCalls.delete(call.id)
+    activeCall.settle()
+    if (activeToolCalls.get(call.id) === activeCall) activeToolCalls.delete(call.id)
   })
 }
 
 function cancelToolCall(id: string): void {
-  activeToolCalls.get(id)?.abort()
+  const call = activeToolCalls.get(id)
+  if (call !== undefined && !call.committed) call.controller.abort()
 }
 
-function cancelActiveToolCallsWithResults(): void {
-  for (const [id, controller] of activeToolCalls) {
-    controller.abort()
-    bridge?.send({
-      t: 'tool.result',
-      id,
-      ok: false,
-      error: { code: 'action-failed', message: 'Tool call was cancelled' },
-    })
+async function revokeUnrestrictedAccess(): Promise<void> {
+  const calls = [...activeToolCalls.values()]
+  for (const call of calls) {
+    if (!call.committed) call.controller.abort()
   }
-  activeToolCalls.clear()
+  await Promise.allSettled(calls.map(async (call) => { await call.settled }))
 }
 
 function cancelAllToolCalls(): void {
-  for (const controller of activeToolCalls.values()) controller.abort()
+  for (const call of activeToolCalls.values()) {
+    if (!call.committed) call.controller.abort()
+  }
   activeToolCalls.clear()
 }
 
