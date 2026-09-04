@@ -548,3 +548,178 @@ describe('dispatchToolCall', () => {
     expect(chromeMock.getAllFrames).toHaveBeenCalledTimes(3)
   })
 })
+
+describe('dispatchOpenTab', () => {
+  it('creates a blank tab, navigates after arming readiness, rebinds, and snapshots', async () => {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const runtimeListeners = new Set<(message: unknown, sender: chrome.runtime.MessageSender) => void>()
+    const create = vi.fn(async () => ({ id: 42, windowId: 9, url: '' }))
+    const update = vi.fn(async () => ({ id: 42, windowId: 9, url: 'https://docs.example/' }))
+    const remove = vi.fn(async () => undefined)
+    const sendMessage = vi.fn(async () => ({ ok: true, result: { text: 'new page' } }))
+    const getAllFrames = vi.fn(async () => [{
+      frameId: 0, parentFrameId: -1, documentId: 'doc-42', url: 'https://docs.example/',
+    }])
+    vi.stubGlobal('chrome', {
+      tabs: { create, update, remove, sendMessage, query: vi.fn(async () => []) },
+      scripting: { executeScript: vi.fn(async () => [{ frameId: 0, result: undefined }]) },
+      webNavigation: { getAllFrames },
+      runtime: {
+        onMessage: {
+          addListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.add(listener)
+          },
+          removeListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.delete(listener)
+          },
+        },
+      },
+    })
+
+    const bindCreatedTab = vi.fn(() => true)
+    const open = dispatchOpenTab(
+      { id: 'open-1', name: 'browser_open_tab', args: { url: 'https://docs.example/' } },
+      9,
+      'auto',
+      { maxItems: 60, maxChars: 12_000 },
+      async () => 'approved',
+      undefined,
+      bindCreatedTab,
+      () => true,
+    )
+    await vi.waitFor(() => { expect(runtimeListeners.size).toBe(1) })
+    expect(create).toHaveBeenCalledWith({ active: true, windowId: 9 })
+    expect(update).toHaveBeenCalledWith(42, { url: 'https://docs.example/' })
+    for (const listener of runtimeListeners) {
+      listener(
+        { type: 'DSH_CONTENT_READY' },
+        { tab: { id: 42 }, frameId: 0, documentId: 'doc-42' } as chrome.runtime.MessageSender,
+      )
+    }
+    const answer = await open
+    expect(bindCreatedTab).toHaveBeenCalledOnce()
+    expect(remove).not.toHaveBeenCalled()
+    expect(answer.ok).toBe(true)
+    expect((answer.result as { text: string }).text).toContain('Opened a new tab')
+    expect((answer.result as { text: string }).text).toContain('new page')
+  })
+
+  it('rejects non-http URLs before creating a tab', async () => {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const create = vi.fn()
+    vi.stubGlobal('chrome', { tabs: { create } })
+    const answer = await dispatchOpenTab(
+      { id: 'open-bad', name: 'browser_open_tab', args: { url: 'javascript:alert(1)' } },
+      1,
+      'auto',
+      undefined,
+      async () => 'approved',
+      undefined,
+      () => true,
+      () => true,
+    )
+    expect(answer).toEqual({
+      ok: false,
+      error: { code: 'action-failed', message: 'url must be a complete http or https URL.' },
+    })
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it('rolls back an unbound tab when cancelled before affinity bind', async () => {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const controller = new AbortController()
+    const runtimeListeners = new Set<(message: unknown, sender: chrome.runtime.MessageSender) => void>()
+    const create = vi.fn(async () => ({ id: 55, windowId: 2, url: '' }))
+    const update = vi.fn(async () => ({ id: 55, windowId: 2, url: 'https://docs.example/' }))
+    const remove = vi.fn(async () => undefined)
+    vi.stubGlobal('chrome', {
+      tabs: { create, update, remove, sendMessage: vi.fn(), query: vi.fn(async () => []) },
+      scripting: { executeScript: vi.fn(async () => []) },
+      webNavigation: { getAllFrames: vi.fn(async () => []) },
+      runtime: {
+        onMessage: {
+          addListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.add(listener)
+          },
+          removeListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.delete(listener)
+          },
+        },
+      },
+    })
+    const bindCreatedTab = vi.fn(() => true)
+    const open = dispatchOpenTab(
+      { id: 'open-cancel', name: 'browser_open_tab', args: { url: 'https://docs.example/' } },
+      2,
+      'auto',
+      undefined,
+      async () => 'approved',
+      controller.signal,
+      bindCreatedTab,
+      () => true,
+    )
+    await vi.waitFor(() => { expect(runtimeListeners.size).toBe(1) })
+    controller.abort()
+    await expect(open).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'bridge-closed' },
+    })
+    expect(remove).toHaveBeenCalledWith(55)
+    expect(bindCreatedTab).not.toHaveBeenCalled()
+  })
+
+  it('reports a committed open instead of cancellation after affinity bind', async () => {
+    const { dispatchOpenTab } = await import('../src/background/tools.ts')
+    const controller = new AbortController()
+    const runtimeListeners = new Set<(message: unknown, sender: chrome.runtime.MessageSender) => void>()
+    const create = vi.fn(async () => ({ id: 77, windowId: 3, url: '' }))
+    const update = vi.fn(async () => ({ id: 77, windowId: 3, url: 'https://docs.example/' }))
+    const remove = vi.fn(async () => undefined)
+    const sendMessage = vi.fn(async () => ({ ok: true, result: { text: 'late page' } }))
+    const getAllFrames = vi.fn(async () => [{
+      frameId: 0, parentFrameId: -1, documentId: 'doc-77', url: 'https://docs.example/',
+    }])
+    vi.stubGlobal('chrome', {
+      tabs: { create, update, remove, sendMessage, query: vi.fn(async () => []) },
+      scripting: { executeScript: vi.fn(async () => [{ frameId: 0, result: undefined }]) },
+      webNavigation: { getAllFrames },
+      runtime: {
+        onMessage: {
+          addListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.add(listener)
+          },
+          removeListener: (listener: (message: unknown, sender: chrome.runtime.MessageSender) => void) => {
+            runtimeListeners.delete(listener)
+          },
+        },
+      },
+    })
+    const bindCreatedTab = vi.fn(() => {
+      controller.abort()
+      return true
+    })
+    const open = dispatchOpenTab(
+      { id: 'open-committed', name: 'browser_open_tab', args: { url: 'https://docs.example/' } },
+      3,
+      'auto',
+      { maxItems: 60, maxChars: 12_000 },
+      async () => 'approved',
+      controller.signal,
+      bindCreatedTab,
+      () => true,
+    )
+    await vi.waitFor(() => { expect(runtimeListeners.size).toBe(1) })
+    for (const listener of runtimeListeners) {
+      listener(
+        { type: 'DSH_CONTENT_READY' },
+        { tab: { id: 77 }, frameId: 0, documentId: 'doc-77' } as chrome.runtime.MessageSender,
+      )
+    }
+    const answer = await open
+    expect(answer.ok).toBe(true)
+    expect((answer.result as { text: string }).text).toContain('Opened a new tab')
+    expect((answer.result as { text: string }).text).toContain('Call browser_snapshot again')
+    expect(remove).not.toHaveBeenCalled()
+    expect(sendMessage).not.toHaveBeenCalled()
+  })
+})

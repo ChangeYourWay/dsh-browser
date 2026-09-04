@@ -100,6 +100,8 @@ describe('registerBrowserTools', () => {
 
     await run('browser_navigate', { url: 'https://example.com' })
     expect(requestTool).toHaveBeenLastCalledWith('browser_navigate', { url: 'https://example.com' }, exec.signal, 1_000)
+    await run('browser_open_tab', { url: 'https://example.com/new' })
+    expect(requestTool).toHaveBeenLastCalledWith('browser_open_tab', { url: 'https://example.com/new' }, exec.signal, 1_000)
 
     for (const name of ['browser_back', 'browser_forward', 'browser_reload'] as const) {
       await run(name, {})
@@ -170,7 +172,7 @@ describe('registerBrowserTools', () => {
       const params = byName.get(name)!.parameters as { properties: { frame?: { type?: unknown } } }
       expect(params.properties.frame?.type).toBe('number')
     }
-    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_back', 'browser_forward', 'browser_reload']) {
+    for (const name of ['browser_snapshot', 'browser_navigate', 'browser_open_tab', 'browser_back', 'browser_forward', 'browser_reload']) {
       const params = byName.get(name)!.parameters as { properties: { frame?: unknown } }
       expect(params.properties.frame).toBeUndefined()
     }

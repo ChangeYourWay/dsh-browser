@@ -58,6 +58,7 @@ export const BROWSER_TOOL_NAMES = [
   'browser_press',
   'browser_scroll',
   'browser_navigate',
+  'browser_open_tab',
   'browser_back',
   'browser_forward',
   'browser_reload',
@@ -205,6 +206,17 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     execute: (args, exec) => call(exec, 'browser_navigate', args as Record<string, unknown>),
   })
 
+  const openTab = (): ToolDefinition => defineTool({
+    name: 'browser_open_tab',
+    description: 'Open an HTTP(S) URL in a new browser tab and make that tab the controlled target for later browser tools.',
+    parameters: {
+      url: { type: 'string', required: true, description: 'Complete http or https URL.' },
+    },
+    timeoutMs: options.toolTimeoutMs,
+    output: TEXT_OUTPUT,
+    execute: (args, exec) => call(exec, 'browser_open_tab', args as Record<string, unknown>),
+  })
+
   const simple = (name: 'browser_back' | 'browser_forward' | 'browser_reload', description: string): ToolDefinition => defineTool({
     name,
     description,
@@ -257,6 +269,7 @@ function defineTools(call: Call, options: BrowserToolsOptions): ToolDefinition[]
     press(),
     scroll(),
     navigate(),
+    openTab(),
     simple('browser_back', 'Go back to the previous page.'),
     simple('browser_forward', 'Go forward to the next page.'),
     simple('browser_reload', 'Reload the current page.'),

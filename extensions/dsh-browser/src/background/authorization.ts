@@ -11,6 +11,7 @@ const STATE_CHANGING_ACTIONS = new Set([
   'browser_type',
   'browser_press',
   'browser_navigate',
+  'browser_open_tab',
   'browser_back',
   'browser_forward',
   'browser_reload',
@@ -40,6 +41,17 @@ export function approvalPromptForCall(
   }
 
   if (!STATE_CHANGING_ACTIONS.has(call.name)) return undefined
+  if (call.name === 'browser_open_tab') {
+    const destination = originFromUrl(typeof call.args.url === 'string' ? call.args.url : '')
+    return {
+      kind: 'action',
+      action: call.name,
+      summary: summarizeAction(call, locale),
+      // A new tab does not mutate the current page; only the destination matters.
+      origins: destination === undefined ? [] : [destination],
+      canTrust: destination !== undefined,
+    }
+  }
   const frameId = requestedFrame(call.args)
   const target = frames.find((frame) => frame.frameId === frameId) ?? frames.find((frame) => frame.frameId === 0)
   const origins = uniqueOrigins(target === undefined ? [] : [target], frames)
@@ -118,6 +130,11 @@ function summarizeAction(call: ToolCall, locale: UiLocale): string {
       locale,
       `Navigate to ${displayUrl(typeof call.args.url === 'string' ? call.args.url : '', locale)}`,
       `导航到 ${displayUrl(typeof call.args.url === 'string' ? call.args.url : '', locale)}`,
+    )
+    case 'browser_open_tab': return localized(
+      locale,
+      `Open a new tab at ${displayUrl(typeof call.args.url === 'string' ? call.args.url : '', locale)}`,
+      `在新标签页打开 ${displayUrl(typeof call.args.url === 'string' ? call.args.url : '', locale)}`,
     )
     case 'browser_back': return localized(locale, 'Go back in browser history (destination domain unknown)', '返回浏览历史上一页（目标域名未知）')
     case 'browser_forward': return localized(locale, 'Go forward in browser history (destination domain unknown)', '前进到浏览历史下一页（目标域名未知）')
