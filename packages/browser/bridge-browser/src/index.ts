@@ -4,11 +4,12 @@
  *
  * The bridge mounts its own upgrade route (`/ext/bridge`) on the host
  * webserver, OUTSIDE the /api trust fence — so it brings its own bearer-token
- * authentication (first frame `hello` within HELLO_TIMEOUT_MS). Gateway RPCs
- * from the extension are dispatched through the same fetch-shaped handler the
- * /api carrier uses, and session events are pumped per connection. Tools
- * execute by dispatching `tool.call` frames to the connected extension, which
- * performs the action in the tab explicitly controlled by the user.
+ * authentication (first frame `hello` within HELLO_TIMEOUT_MS). Extension
+ * calls, Session streams, and Host waterfalls use dsh 0.1.2's Typert Gateway
+ * and Connection services, with a temporary 0.1.1-rc.2 ApiProxy adapter.
+ * Tools execute by dispatching
+ * `tool.call` frames to the connected extension, which performs the action in
+ * the tab explicitly controlled by the user.
  *
  * Opt-in by design: nothing is registered unless this plugin appears in the
  * composition. No dsh core code is touched.
@@ -20,13 +21,10 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
+import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-host-apiproxy'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { BridgeServer } from './server.ts'
 import { BrowserContextInjector } from './browser-context.ts'
@@ -41,12 +39,19 @@ import { withSessionDeferral } from './session-deferral.ts'
 import { withSessionWorkspace } from './session-workspace.ts'
 import { purgeSessionFiles, type SessionPurgeDeps } from './session-purge.ts'
 import { resolveToken } from './token.ts'
+import {
+  createRemoteHostApi,
+  type HostConnectionLike,
+  type TypertGatewayLike,
+} from './remote-host-api.ts'
+import { createLegacyHostApi } from './legacy-host-api.ts'
+import { isRecord, type BrowserHostApi } from './host-api.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'bridge-browser'
 
 /** Services required by this plugin. */
-export const inject = ['webServer', 'apiProxy', 'tools', 'agents']
+export const inject = ['webServer', 'typertGateway', 'connection', 'tools', 'agents']
 
 /** Default per-tool-call budget (ms). */
 const DEFAULT_TOOL_TIMEOUT_MS = 90_000
@@ -132,11 +137,33 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const resolved = resolveConfig(config)
 
   const tokenRes = await resolveToken(resolved.token)
+  const gateway = ctx.get('typertGateway') as unknown as GatewayCandidate | undefined
+  const connection = ctx.get('connection') as unknown as HostConnectionLike | undefined
+  if (gateway === undefined) throw new Error('bridge-browser: dsh typertGateway service is required')
+  // TEMPORARY rc.2 compatibility. Remove this branch, createRc2HostApi(),
+  // legacy-host-api.ts, and dsh-host-apiproxy deps once minimum dsh is 0.1.2.
+  if (!hasRemoteWireStream(gateway)) {
+    await ctx.inject(['apiProxy'], async (legacyCtx) => {
+      mountBridge(legacyCtx, resolved, tokenRes, await createRc2HostApi(legacyCtx))
+    })
+    return
+  }
+  if (connection === undefined) throw new Error('bridge-browser: dsh connection service is required')
+  await ensureRemoteEventSource(ctx, gateway)
+  mountBridge(ctx, resolved, tokenRes, createRemoteHostApi(gateway, connection))
+}
+
+function mountBridge(
+  ctx: Context,
+  resolved: ResolvedConfig,
+  tokenRes: Awaited<ReturnType<typeof resolveToken>>,
+  hostApi: BrowserHostApi,
+): void {
   // Workspace grouping wraps the gateway create; session deferral wraps the
   // result so materialization at first prompt still flows through grouping.
-  const api: ApiProxy = withSessionDeferral(
+  const api = withSessionDeferral(
     withSessionWorkspace(
-      ctx.apiProxy,
+      hostApi,
       resolved.sessionWorkspacePath,
       message => { ctx.logger.warn(message) },
     ),
@@ -144,15 +171,26 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     ctx.get('attachments')?.imageLimits,
   )
   const browserContext = new BrowserContextInjector(ctx.agents)
-  ctx.on('agent/session-start', ({ agent }) => { browserContext.activate(agent) })
+  ctx.on('agent/session-start', ({ agent }) => {
+    // rc.2 and 0.1.2 brand Agent/Session identities differently, although the
+    // runtime surface used here (`id` + `inject`) is intentionally unchanged.
+    browserContext.activate(agent as Parameters<BrowserContextInjector['activate']>[0])
+  })
 
   const purgeSession = async (sessionId: string): Promise<void> => {
     const runningSessionIds = new Set<string>()
     try {
-      const listed = await api.sessions.list({ rpcId: RpcId(randomUUID()), payload: {} })
-      if (listed.result.ok) {
-        for (const entry of listed.result.value.items) {
-          if (entry.running) runningSessionIds.add(entry.sessionId)
+      const listed = await api.call({
+        rpcId: randomUUID(),
+        method: 'session.list',
+        payload: {},
+        signal: new AbortController().signal,
+      })
+      if (listed.ok && isRecord(listed.value) && Array.isArray(listed.value.items)) {
+        for (const entry of listed.value.items) {
+          if (isRecord(entry) && entry.running === true && typeof entry.sessionId === 'string') {
+            runningSessionIds.add(entry.sessionId)
+          }
         }
       }
     } catch {
@@ -165,8 +203,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const server = new BridgeServer({
     token: tokenRes.token,
-    apiHandler: toFetchHandler(api),
-    openEvents: (signal) => api.events.mux({ rpcId: RpcId(randomUUID()), payload: {} }, signal),
+    api,
     toolTimeoutMs: resolved.toolTimeoutMs,
     caps: {
       textOnly: true,
@@ -227,4 +264,50 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       : `browser bridge: using token from ${tokenRes.file}`,
   )
   ctx.logger.info(`browser bridge: listening on ${BRIDGE_PATH}`)
+}
+
+type GatewayCandidate = Pick<TypertGatewayLike, 'invoke'> & {
+  readonly wireStream?: TypertGatewayLike['wireStream']
+}
+
+/** Distinguish the 0.1.2 Gateway contract from temporary 0.1.1-rc.2 support. */
+function hasRemoteWireStream(gateway: GatewayCandidate): gateway is TypertGatewayLike {
+  return gateway.wireStream !== undefined
+    && typeof gateway.wireStream.open === 'function'
+    && typeof gateway.wireStream.failure === 'function'
+}
+
+/**
+ * TEMPORARY 0.1.2-rc.1 packaging workaround.
+ *
+ * The rc.1 web profile lists api-remotes but can leave its `$events` source
+ * unregistered. Remove this function, its call above, and the direct
+ * dsh-api-remotes dependency once the profile reliably owns registration.
+ */
+async function ensureRemoteEventSource(ctx: Context, gateway: TypertGatewayLike): Promise<void> {
+  const controller = new AbortController()
+  let iterator: AsyncIterator<unknown> | undefined
+  try {
+    const source = await gateway.wireStream.open('$events', { args: {} }, controller.signal)
+    iterator = source[Symbol.asyncIterator]()
+    const first = await iterator.next()
+    if (!first.done && isRecord(first.value) && first.value.type === 'ready') return
+    throw new TypeError('dsh $events stream did not begin with a ready frame')
+  } catch (error: unknown) {
+    const failure = gateway.wireStream.failure(error)
+    if (failure.code !== 'gateway/service-unavailable') throw error
+  } finally {
+    controller.abort(new Error('dsh $events readiness probe completed'))
+    await iterator?.return?.()
+  }
+
+  const remoteAssembly = await import('@deepseek-ai/dsh-api-remotes')
+  remoteAssembly.apply(ctx)
+}
+
+async function createRc2HostApi(ctx: Context): Promise<BrowserHostApi> {
+  const apiProxy = ctx.get('apiProxy') as ApiProxy | undefined
+  if (apiProxy === undefined) throw new Error('bridge-browser: dsh 0.1.1-rc.2 apiProxy service is required')
+  const { toFetchHandler } = await import('@deepseek-ai/dsh-host-apiproxy')
+  return createLegacyHostApi(apiProxy, toFetchHandler(apiProxy))
 }

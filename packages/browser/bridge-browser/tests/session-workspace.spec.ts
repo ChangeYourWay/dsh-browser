@@ -2,13 +2,10 @@ import { mkdtemp, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { SessionId } from '@deepseek-ai/dsh-session'
-import type { ApiProxy, WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
+import type { BrowserHostApi, HostRpcCall, HostRpcResult } from '../src/host-api.ts'
 import { withSessionWorkspace } from '../src/session-workspace.ts'
 
-const WORKSPACE_ID = 'workspace-browser' as WorkspaceId
-const SESSION_ID = SessionId('session-browser')
+const WORKSPACE_ID = 'workspace-browser'
 const dirs: string[] = []
 
 afterEach(async () => {
@@ -21,154 +18,124 @@ async function tempWorkspacePath(): Promise<string> {
   return join(root, 'browser-sessions')
 }
 
-function sessionRequest(
-  payload: Parameters<ApiProxy['sessions']['create']>[0]['payload'] = {},
-  rpcId = 'session-rpc',
-): Parameters<ApiProxy['sessions']['create']>[0] {
-  return { rpcId: RpcId(rpcId), payload }
+function request(payload: Record<string, unknown> = {}, rpcId = 'session-rpc'): HostRpcCall {
+  return {
+    rpcId,
+    method: 'session.create',
+    payload,
+    signal: new AbortController().signal,
+  }
 }
 
-function apiHarness(options: {
-  workspace?: ApiProxy['workspace']['create']
-} = {}) {
-  const sessionCreate = vi.fn(async (request: Parameters<ApiProxy['sessions']['create']>[0]) => ({
-    rpcId: request.rpcId,
-    result: { ok: true as const, value: { sessionId: SESSION_ID } },
+function apiHarness(workspaceCreate?: (call: HostRpcCall) => Promise<HostRpcResult>) {
+  const sessionCreate = vi.fn(async (): Promise<HostRpcResult> => ({
+    ok: true, value: { sessionId: 'session-browser' },
   }))
-  const api = {
-    sessions: { create: sessionCreate },
-    ...(options.workspace === undefined ? {} : { workspace: { create: options.workspace } }),
-  } as unknown as ApiProxy
-  return { api, sessionCreate }
+  const call = vi.fn(async (input: HostRpcCall): Promise<HostRpcResult> => {
+    if (input.method === 'session.create') return sessionCreate(input)
+    if (input.method === 'workspace.create' && workspaceCreate !== undefined) return workspaceCreate(input)
+    return { ok: false, error: { code: 'not-found', message: 'workspace API is unavailable', details: {} } }
+  })
+  const api: BrowserHostApi = {
+    call,
+    async *events() {},
+    respond: async () => ({ accepted: false }),
+  }
+  return { api, call, sessionCreate }
 }
 
-function workspaceSuccess(
-  inspect?: (path: string) => Promise<void>,
-): ApiProxy['workspace']['create'] {
-  return vi.fn(async (request) => {
-    const path = request.payload.path as string
+function workspaceSuccess(inspect?: (path: string) => Promise<void>) {
+  return vi.fn(async (call: HostRpcCall): Promise<HostRpcResult> => {
+    const path = (call.payload as { path: string }).path
     await inspect?.(path)
     return {
-      rpcId: request.rpcId,
-      result: {
-        ok: true,
-        value: {
-          created: true,
-          workspace: {
-            workspaceId: WORKSPACE_ID,
-            path,
-            title: 'browser-sessions',
-            sessionIds: [],
-            createdAt: '2026-08-06T00:00:00.000Z',
-            updatedAt: '2026-08-06T00:00:00.000Z',
-          },
-        },
+      ok: true,
+      value: {
+        created: true,
+        workspace: { workspaceId: WORKSPACE_ID, path, title: 'browser-sessions', sessionIds: [] },
       },
     }
   })
 }
 
 describe('withSessionWorkspace', () => {
-  it('creates the directory before one cached workspace registration and injects its id', async () => {
+  it('creates one cached workspace and injects its id into implicit Session creation', async () => {
     const workspacePath = await tempWorkspacePath()
     const workspaceCreate = workspaceSuccess(async (path) => {
       expect((await stat(path)).isDirectory()).toBe(true)
     })
-    const { api, sessionCreate } = apiHarness({ workspace: workspaceCreate })
+    const { api, sessionCreate } = apiHarness(workspaceCreate)
     const warn = vi.fn()
     const wrapped = withSessionWorkspace(api, workspacePath, warn)
-    const chosenId = SessionId('session-chosen')
 
     await Promise.all([
-      wrapped.sessions.create(sessionRequest({ cwd: '/ignored', sessionId: chosenId }, 'first')),
-      wrapped.sessions.create(sessionRequest({}, 'second')),
+      wrapped.call(request({ cwd: '/ignored', sessionId: 'session-chosen' }, 'first')),
+      wrapped.call(request({}, 'second')),
     ])
 
-    expect(workspaceCreate).toHaveBeenCalledTimes(1)
-    expect(workspaceCreate).toHaveBeenCalledWith(expect.objectContaining({ payload: { path: workspacePath } }))
-    expect(sessionCreate).toHaveBeenNthCalledWith(1, {
-      rpcId: RpcId('first'),
-      payload: { sessionId: chosenId, workspaceId: WORKSPACE_ID },
-    })
-    expect(sessionCreate).toHaveBeenNthCalledWith(2, {
-      rpcId: RpcId('second'),
-      payload: { workspaceId: WORKSPACE_ID },
-    })
+    expect(workspaceCreate).toHaveBeenCalledOnce()
+    expect(workspaceCreate).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'workspace.create', payload: { path: workspacePath },
+    }))
+    expect(sessionCreate).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      rpcId: 'first', payload: { sessionId: 'session-chosen', workspaceId: WORKSPACE_ID },
+    }))
+    expect(sessionCreate).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      rpcId: 'second', payload: { workspaceId: WORKSPACE_ID },
+    }))
     expect(warn).not.toHaveBeenCalled()
   })
 
   it('passes an explicit workspace id through without preparing the configured workspace', async () => {
     const workspacePath = await tempWorkspacePath()
     const workspaceCreate = workspaceSuccess()
-    const { api, sessionCreate } = apiHarness({ workspace: workspaceCreate })
+    const { api, sessionCreate } = apiHarness(workspaceCreate)
     const wrapped = withSessionWorkspace(api, workspacePath, vi.fn())
-    const request = sessionRequest({ workspaceId: 'workspace-explicit' as WorkspaceId })
+    const original = request({ workspaceId: 'workspace-explicit' })
 
-    await wrapped.sessions.create(request)
+    await wrapped.call(original)
 
-    expect(sessionCreate).toHaveBeenCalledWith(request)
+    expect(sessionCreate).toHaveBeenCalledWith(original)
     expect(workspaceCreate).not.toHaveBeenCalled()
     await expect(stat(workspacePath)).rejects.toThrow()
   })
 
   it('returns the original API when grouping is opted out', () => {
-    const workspaceCreate = workspaceSuccess()
-    const { api } = apiHarness({ workspace: workspaceCreate })
-
+    const { api } = apiHarness(workspaceSuccess())
     expect(withSessionWorkspace(api, '', vi.fn())).toBe(api)
-    expect(workspaceCreate).not.toHaveBeenCalled()
   })
 
-  it('caches a missing workspace domain and falls through to plain session creation', async () => {
+  it('caches a workspace failure and preserves ungrouped Session creation', async () => {
     const workspacePath = await tempWorkspacePath()
-    const { api, sessionCreate } = apiHarness()
-    const warn = vi.fn()
-    const wrapped = withSessionWorkspace(api, workspacePath, warn)
-    const request = sessionRequest({ cwd: '/original' })
-
-    await wrapped.sessions.create(request)
-    await wrapped.sessions.create(request)
-
-    expect(sessionCreate).toHaveBeenCalledTimes(2)
-    expect(sessionCreate).toHaveBeenNthCalledWith(1, request)
-    expect(warn).toHaveBeenCalledOnce()
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('workspace API is unavailable'))
-  })
-
-  it('caches a workspace.create business failure and preserves session creation', async () => {
-    const workspacePath = await tempWorkspacePath()
-    const workspaceCreate = vi.fn(async (request: Parameters<ApiProxy['workspace']['create']>[0]) => ({
-      rpcId: request.rpcId,
-      result: {
-        ok: false as const,
-        error: { code: 'internal' as const, message: 'workspace service missing', details: {} },
-      },
+    const workspaceCreate = vi.fn(async (): Promise<HostRpcResult> => ({
+      ok: false,
+      error: { code: 'internal', message: 'workspace service missing', details: {} },
     }))
-    const { api, sessionCreate } = apiHarness({ workspace: workspaceCreate })
+    const { api, sessionCreate } = apiHarness(workspaceCreate)
     const warn = vi.fn()
     const wrapped = withSessionWorkspace(api, workspacePath, warn)
-    const request = sessionRequest()
+    const original = request({ cwd: '/original' })
 
-    await wrapped.sessions.create(request)
-    await wrapped.sessions.create(request)
+    await wrapped.call(original)
+    await wrapped.call(original)
 
     expect(workspaceCreate).toHaveBeenCalledOnce()
     expect(sessionCreate).toHaveBeenCalledTimes(2)
-    expect(sessionCreate).toHaveBeenNthCalledWith(1, request)
+    expect(sessionCreate).toHaveBeenNthCalledWith(1, original)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('workspace.create failed'))
   })
 
-  it('catches a thrown workspace failure and preserves session creation', async () => {
+  it('catches a thrown workspace failure and preserves Session creation', async () => {
     const workspacePath = await tempWorkspacePath()
-    const workspaceCreate = vi.fn(async () => { throw new Error('domain unavailable') })
-    const { api, sessionCreate } = apiHarness({ workspace: workspaceCreate })
+    const workspaceCreate = vi.fn(async (): Promise<HostRpcResult> => { throw new Error('domain unavailable') })
+    const { api, sessionCreate } = apiHarness(workspaceCreate)
     const warn = vi.fn()
     const wrapped = withSessionWorkspace(api, workspacePath, warn)
-    const request = sessionRequest({ cwd: '/original' })
+    const original = request({ cwd: '/original' })
 
-    await wrapped.sessions.create(request)
+    await wrapped.call(original)
 
-    expect(sessionCreate).toHaveBeenCalledWith(request)
+    expect(sessionCreate).toHaveBeenCalledWith(original)
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('domain unavailable'))
   })
 })

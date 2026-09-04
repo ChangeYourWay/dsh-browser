@@ -2,11 +2,10 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { BridgeServer, BridgeToolError, isLoopbackAddress, messageToText, payloadCode, payloadMessage } from '../src/server.ts'
 import { BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD, BRIDGE_SESSION_PURGE_METHOD, type BridgeFrame } from '../src/protocol.ts'
 import { SessionPurgeError } from '../src/session-purge.ts'
+import type { BrowserHostApi, HostEventFrame } from '../src/host-api.ts'
 
 const TOKEN = 'deadbeefdeadbeefdeadbeefdeadbeef'
 
@@ -21,24 +20,27 @@ interface Harness {
   bridge: BridgeServer
   server: Server
   url: string
-  fetchMock: ReturnType<typeof vi.fn>
+  callMock: ReturnType<typeof vi.fn>
+  respondMock: ReturnType<typeof vi.fn>
 }
 
 async function startBridge(overrides: Partial<ConstructorParameters<typeof BridgeServer>[0]> = {}): Promise<Harness> {
-  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ type: 'server-response', rpcId: 'r', result: { ok: true, value: 'ok' } }), {
-    status: 200,
-    headers: { 'content-type': 'application/json' },
-  }))
-  const events: AsyncIterable<RpcRequest<MuxFrame>> = {
+  const callMock = vi.fn(async () => ({ ok: true as const, value: 'ok' }))
+  const respondMock = vi.fn(async () => ({ accepted: true }))
+  const events: AsyncIterable<HostEventFrame> = {
     async *[Symbol.asyncIterator]() {
-      yield { rpcId: RpcId('e1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
-      yield { rpcId: RpcId('e2'), payload: { type: 'session/queue', sessionId: 's1' as never, items: [] } }
+      yield { rpcId: 'e1', method: 'session/subscribed', payload: { type: 'session/subscribed', sessionId: 's1', lastSeq: 0 } }
+      yield { rpcId: 'e2', method: 'session/queue', payload: { type: 'session/queue', sessionId: 's1', items: [] } }
     },
+  }
+  const api: BrowserHostApi = {
+    call: callMock,
+    events: () => events,
+    respond: respondMock,
   }
   const bridge = new BridgeServer({
     token: TOKEN,
-    apiHandler: { fetch: fetchMock },
-    openEvents: () => events,
+    api,
     toolTimeoutMs: 1_000,
     caps: { textOnly: true, snapshotMaxChars: 12_000, maxInteractiveItems: 60 },
     injectBrowserSnapshot: vi.fn(),
@@ -49,7 +51,16 @@ async function startBridge(overrides: Partial<ConstructorParameters<typeof Bridg
   server.on('upgrade', (req, socket, head) => { bridge.handleUpgrade(req, socket, head) })
   await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve) })
   const port = (server.address() as AddressInfo).port
-  return { bridge, server, url: `ws://127.0.0.1:${port}/ext/bridge`, fetchMock }
+  return { bridge, server, url: `ws://127.0.0.1:${port}/ext/bridge`, callMock, respondMock }
+}
+
+function hostApi(overrides: Partial<BrowserHostApi> = {}): BrowserHostApi {
+  return {
+    call: async () => ({ ok: true, value: 'ok' }),
+    async *events() {},
+    respond: async () => ({ accepted: true }),
+    ...overrides,
+  }
 }
 
 function connect(url: string, origin?: string): Promise<{ ws: WebSocket; frames: BridgeFrame[]; done: Promise<void> }> {
@@ -191,7 +202,7 @@ describe('BridgeServer', () => {
     expect(ws.readyState).toBe(WebSocket.CLOSED)
   })
 
-  it('passes rpc frames to the gateway handler and relays the envelope', async () => {
+  it('passes rpc frames to the Host adapter and relays a server-response envelope', async () => {
     const h = await startBridge()
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
@@ -201,17 +212,17 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((f) => f.t === 'rpc.result'))
     const result = frames.find((f) => f.t === 'rpc.result')
     expect(result).toMatchObject({ t: 'rpc.result', id: 'rpc-1', ok: true })
-    expect(h.fetchMock).toHaveBeenCalledTimes(1)
-    const request = h.fetchMock.mock.calls[0]![0] as Request
-    expect(request.url).toBe('http://dsh.internal/api/session.list')
-    expect(request.method).toBe('POST')
-    expect(request.headers.get('content-type')).toBe('application/json')
-    expect(JSON.parse(await request.text())).toEqual({ type: 'client-request', rpcId: 'rpc-1', method: 'session.list', payload: {} })
+    expect(result).toMatchObject({
+      result: { type: 'server-response', rpcId: 'rpc-1', result: { ok: true, value: 'ok' } },
+    })
+    expect(h.callMock).toHaveBeenCalledWith({
+      rpcId: 'rpc-1', method: 'session.list', payload: {}, signal: expect.any(AbortSignal),
+    })
     ws.close()
   })
 
-  it('reports gateway failures as rpc.result errors', async () => {
-    const h = await startBridge({ apiHandler: { fetch: async () => new Response('handler failure: boom', { status: 500 }) } })
+  it('reports unexpected Host adapter failures as rpc.result errors', async () => {
+    const h = await startBridge({ api: hostApi({ call: async () => { throw new Error('boom') } }) })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: { textOnly: true, snapshotMaxChars: 12000, maxInteractiveItems: 60 } })
@@ -219,7 +230,7 @@ describe('BridgeServer', () => {
     send(ws, { t: 'rpc', id: 'rpc-2', method: 'session.list', payload: {} })
     await waitFor(() => frames.some((f) => f.t === 'rpc.result' && f.id === 'rpc-2'))
     expect(frames.find((f) => f.t === 'rpc.result' && f.id === 'rpc-2'))
-      .toMatchObject({ t: 'rpc.result', id: 'rpc-2', ok: false, error: { code: 'http' } })
+      .toMatchObject({ t: 'rpc.result', id: 'rpc-2', ok: false, error: { code: 'internal', message: 'Error: boom' } })
     ws.close()
   })
 
@@ -240,7 +251,7 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'snapshot-1'))
 
     expect(injectBrowserSnapshot).toHaveBeenCalledWith('session-1', 'Page: Other target')
-    expect(h.fetchMock).not.toHaveBeenCalled()
+    expect(h.callMock).not.toHaveBeenCalled()
     expect(frames).toContainEqual({
       t: 'rpc.result', id: 'snapshot-1', ok: true, result: { accepted: true },
     })
@@ -275,7 +286,7 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'purge-1'))
 
     expect(purgeSession).toHaveBeenCalledWith('session-82222a77-aab5-4c0b-b33e-6376973ec93d')
-    expect(h.fetchMock).not.toHaveBeenCalled()
+    expect(h.callMock).not.toHaveBeenCalled()
     expect(frames).toContainEqual({
       t: 'rpc.result', id: 'purge-1', ok: true, result: { purged: true },
     })
@@ -331,9 +342,9 @@ describe('BridgeServer', () => {
     })
 
     await waitFor(() => injectBrowserSnapshot.mock.calls.length === 1)
-    expect(h.fetchMock).not.toHaveBeenCalled()
+    expect(h.callMock).not.toHaveBeenCalled()
     releaseInjection()
-    await waitFor(() => h.fetchMock.mock.calls.length === 1)
+    await waitFor(() => h.callMock.mock.calls.length === 1)
     await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'prompt-after-snapshot'))
     expect(frames.filter((frame) => frame.t === 'rpc.result').map((frame) => frame.id)).toEqual([
       'snapshot',
@@ -346,17 +357,13 @@ describe('BridgeServer', () => {
     let releasePrompt!: () => void
     const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve })
     const calls: Array<{ method: string; sessionId: string }> = []
-    const apiHandler = { fetch: vi.fn(async (request: Request) => {
-      const body = await request.json() as { rpcId: string; method: string; payload: { sessionId: string } }
-      calls.push({ method: body.method, sessionId: body.payload.sessionId })
-      if (body.method === 'session.prompt' && body.payload.sessionId === 'provisional') await promptGate
-      return Response.json({
-        type: 'server-response',
-        rpcId: body.rpcId,
-        result: { ok: true, value: { accepted: true } },
-      })
-    }) }
-    const h = await startBridge({ apiHandler })
+    const call = vi.fn(async (request: Parameters<BrowserHostApi['call']>[0]) => {
+      const sessionId = (request.payload as { sessionId: string }).sessionId
+      calls.push({ method: request.method, sessionId })
+      if (request.method === 'session.prompt' && sessionId === 'provisional') await promptGate
+      return { ok: true as const, value: { accepted: true } }
+    })
+    const h = await startBridge({ api: hostApi({ call }) })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
@@ -384,7 +391,7 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('relays interaction responses to /api/respond with the original rpcId', async () => {
+  it('relays interaction responses to the Host adapter with the original rpcId', async () => {
     const h = await startBridge()
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
@@ -401,20 +408,16 @@ describe('BridgeServer', () => {
     expect(frames).toContainEqual(expect.objectContaining({
       t: 'respond.result', id: 'response-1', ok: true,
     }))
-    const request = h.fetchMock.mock.calls[0]![0] as Request
-    expect(request.url).toBe('http://dsh.internal/api/respond')
-    expect(request.method).toBe('POST')
-    expect(request.headers.get('content-type')).toBe('application/json')
-    expect(JSON.parse(await request.text())).toEqual({
-      type: 'client-response',
-      rpcId: 'question-1',
-      result: { ok: true, value: { sessionId: 'session-1', answer: { answers: [{ id: 'db', selected: ['SQLite'] }] } } },
-    })
+    expect(h.respondMock).toHaveBeenCalledWith(
+      'question-1',
+      { ok: true, value: { sessionId: 'session-1', answer: { answers: [{ id: 'db', selected: ['SQLite'] }] } } },
+      expect.any(AbortSignal),
+    )
     ws.close()
   })
 
-  it('returns gateway response failures to the extension', async () => {
-    const h = await startBridge({ apiHandler: { fetch: async () => new Response('response rejected', { status: 409 }) } })
+  it('returns Host response failures to the extension', async () => {
+    const h = await startBridge({ api: hostApi({ respond: async () => { throw new Error('response rejected') } }) })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
@@ -426,7 +429,7 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((frame) => frame.t === 'respond.result' && frame.id === 'response-2'))
     expect(frames).toContainEqual({
       t: 'respond.result', id: 'response-2', ok: false,
-      error: { code: 'http', message: 'response rejected' },
+      error: { code: 'internal', message: 'Error: response rejected' },
     })
     ws.close()
   })
@@ -608,14 +611,14 @@ describe('BridgeServer', () => {
   })
 
   it('stops the stream-failed arm when the pump fails after the socket closed', async () => {
-    const lateFailEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
+    const lateFailEvents: AsyncIterable<HostEventFrame> = {
       async *[Symbol.asyncIterator]() {
-        yield { rpcId: RpcId('l1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
+        yield { rpcId: 'l1', method: 'session/subscribed', payload: { type: 'session/subscribed', sessionId: 's1', lastSeq: 0 } }
         await new Promise((resolve) => { setTimeout(resolve, 120) })
         throw new Error('late failure')
       },
     }
-    const h = await startBridge({ openEvents: () => lateFailEvents })
+    const h = await startBridge({ api: hostApi({ events: () => lateFailEvents }) })
     harnesses.push(h)
     const { ws, frames, done } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
@@ -673,9 +676,12 @@ describe('BridgeServer', () => {
     expect(ws.readyState).toBe(WebSocket.CLOSED)
   })
 
-  it('reports non-JSON 200 bodies and fetch throws as rpc.result errors', async () => {
+  it('relays business failures inside the server-response and isolates thrown adapter errors', async () => {
     const h = await startBridge({
-      apiHandler: { fetch: async () => new Response('plain text body', { status: 200 }) },
+      api: hostApi({ call: async () => ({
+        ok: false,
+        error: { code: 'session-not-found', message: 'missing', details: {} },
+      }) }),
     })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
@@ -683,12 +689,15 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((f) => f.t === 'hello.ok'))
     send(ws, { t: 'rpc', id: 'rpc-3', method: 'session.list', payload: {} })
     await waitFor(() => frames.some((f) => f.t === 'rpc.result' && f.id === 'rpc-3'))
-    const nonJson = frames.find((f) => f.t === 'rpc.result' && f.id === 'rpc-3')!
-    expect(nonJson).toMatchObject({ t: 'rpc.result', id: 'rpc-3', ok: true, result: 'plain text body' })
+    const businessFailure = frames.find((f) => f.t === 'rpc.result' && f.id === 'rpc-3')!
+    expect(businessFailure).toMatchObject({
+      t: 'rpc.result', id: 'rpc-3', ok: true,
+      result: { type: 'server-response', result: { ok: false, error: { code: 'session-not-found' } } },
+    })
     ws.close()
 
     const throwing = await startBridge({
-      apiHandler: { fetch: async () => { throw new Error('boom') } },
+      api: hostApi({ call: async () => { throw new Error('boom') } }),
     })
     harnesses.push(throwing)
     const second = await connect(throwing.url)
@@ -734,32 +743,33 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('emits a stream-failed error frame when the event stream throws', async () => {
-    const failingEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
+  it('reports a failed event stream and closes the generation for reconnect', async () => {
+    const failingEvents: AsyncIterable<HostEventFrame> = {
       async *[Symbol.asyncIterator]() {
-        yield { rpcId: RpcId('f1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
+        yield { rpcId: 'f1', method: 'session/subscribed', payload: { type: 'session/subscribed', sessionId: 's1', lastSeq: 0 } }
         throw new Error('stream broke')
       },
     }
-    const h = await startBridge({ openEvents: () => failingEvents })
+    const h = await startBridge({ api: hostApi({ events: () => failingEvents }) })
     harnesses.push(h)
-    const { ws, frames } = await connect(h.url)
+    const { ws, frames, done } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
     await waitFor(() => frames.some((f) => f.t === 'error' && f.code === 'stream-failed'))
     expect(frames.find((f) => f.t === 'error')).toMatchObject({ t: 'error', code: 'stream-failed' })
-    ws.close()
+    await done
+    expect(ws.readyState).toBe(WebSocket.CLOSED)
   })
 
   it('stops pumping events once the socket closes mid-stream', async () => {
-    const slowEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
+    const slowEvents: AsyncIterable<HostEventFrame> = {
       async *[Symbol.asyncIterator]() {
         for (let i = 0; i < 100; i += 1) {
-          yield { rpcId: RpcId(`s${i}`), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: i } }
+          yield { rpcId: `s${i}`, method: 'session/subscribed', payload: { type: 'session/subscribed', sessionId: 's1', lastSeq: i } }
           await new Promise((resolve) => { setTimeout(resolve, 10) })
         }
       },
     }
-    const h = await startBridge({ openEvents: () => slowEvents })
+    const h = await startBridge({ api: hostApi({ events: () => slowEvents }) })
     harnesses.push(h)
     const { ws, frames, done } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })

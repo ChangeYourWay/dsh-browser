@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 The **browser-operation end** of dsh: the model reads and operates the browser page you have open — extract content, click elements, fill forms, scroll, and navigate, all in the real page with your login state preserved. The side panel is the conversation entry.
 
-**Two explicit channels**: browser pages are still rendered as structured text (a numbered interactive-element inventory), so browser tools never take screenshots. Separately, a dsh 0.1.1 host can advertise multimodal image limits; the side panel then accepts PNG, JPEG, WebP, and GIF attachments and renders their durable history references.
+**Two explicit channels**: browser pages are still rendered as structured text (a numbered interactive-element inventory), so browser tools never take screenshots. Separately, a dsh 0.1.2 host can advertise multimodal image limits; the side panel then accepts PNG, JPEG, WebP, and GIF attachments and renders their durable history references.
 
 ## What the model can do
 
@@ -84,10 +84,10 @@ The recommended zero-configuration command does not require Git or a local clone
 
    From a clone, run `pnpm start` in the repository root instead.
 
-   Or the latest public runtime:
+   Or, once published, the exact supported public runtime:
 
    ```sh
-   npx @deepseek-ai/dsh web
+   npx @deepseek-ai/dsh@0.1.2 web
    ```
 
    Both commands load the same bundle from the local `web` profile. Port 3080 is used by default; append `--port <port>` when it is occupied.
