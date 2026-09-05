@@ -747,7 +747,7 @@ export function App(): React.JSX.Element {
     })
   }, [])
 
-  // 每次连接重启（设置变更/断线重连）都新建会话。状态消息逐条监听：
+  // 每次连接重启（连接配置变更/断线重连）都新建会话。状态消息逐条监听：
   // React 会把 stopped/connecting 等瞬时状态合并进同一帧渲染，依赖渲染
   // 状态无法可靠观察到"连接已重置"，因此在这里按消息粒度判定。
   const [sessionEpoch, setSessionEpoch] = useState(0)

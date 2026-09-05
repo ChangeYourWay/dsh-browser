@@ -116,6 +116,8 @@ export interface TabManagementContext {
   followTab?: (tab: chrome.tabs.Tab) => void | Promise<void>
   /** Mark the point after which a state-changing operation cannot be withdrawn. */
   commitAction?: () => void
+  /** Restore withdrawability when a content-script action was not delivered. */
+  rollbackActionCommit?: () => void
 }
 
 function isToolAnswer(value: unknown): value is ToolAnswer {
@@ -159,6 +161,10 @@ async function sendAction(
     ...budget === undefined ? {} : { budget },
     ...includePageDelta ? { includePageDelta: true } : {},
   }, frame.documentId === undefined ? { frameId: frame.frameId } : { documentId: frame.documentId })
+}
+
+function contentScriptReceiverMissing(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('Receiving end does not exist')
 }
 
 function unavailable(message: string): ToolAnswer {
@@ -428,6 +434,7 @@ async function dispatchOnce(
   targetStillAllowed?: () => boolean,
   includeActionDelta: boolean = false,
   commitAction?: () => void,
+  rollbackActionCommit?: () => void,
 ): Promise<ToolAnswer> {
   if (isCancelled(call, signal)) return cancelled()
   if (targetStillAllowed?.() === false) return targetChanged()
@@ -449,8 +456,9 @@ async function dispatchOnce(
     ? waitForNextDocumentReady(tabId, frameId, frame.documentId, signal)
     : undefined
   let response: unknown
+  const stateChanging = STATE_CHANGING_PAGE_TOOLS.has(call.name)
   try {
-    if (STATE_CHANGING_PAGE_TOOLS.has(call.name)) commitAction?.()
+    if (stateChanging) commitAction?.()
     response = await sendAction(
       tabId,
       call,
@@ -459,6 +467,7 @@ async function dispatchOnce(
       requestPageDelta,
     )
   } catch (error: unknown) {
+    if (stateChanging && contentScriptReceiverMissing(error)) rollbackActionCommit?.()
     navigationWait?.cancel()
     throw error
   }
@@ -738,9 +747,13 @@ export async function dispatchToolCall(
       targetStillAllowed,
       tabManagement.unrestrictedAccess || sharePageContent === 'auto',
       tabManagement.commitAction,
+      tabManagement.rollbackActionCommit,
     )
-  } catch {
+  } catch (error: unknown) {
     if (isCancelled(call, signal)) return cancelled()
+    if (!contentScriptReceiverMissing(error)) {
+      return unavailable('The content script stopped responding after the operation was dispatched. Call browser_snapshot before continuing.')
+    }
     // Manifest content scripts do not run retroactively in tabs that were
     // already open when an unpacked extension was installed or reloaded.
     // Recover in place so the user never has to refresh and lose page state.
@@ -775,6 +788,7 @@ export async function dispatchToolCall(
         targetStillAllowed,
         tabManagement.unrestrictedAccess || sharePageContent === 'auto',
         tabManagement.commitAction,
+        tabManagement.rollbackActionCommit,
       )
     } catch {
       return unavailable('The content script did not answer after it was loaded. Call browser_snapshot again before retrying.')

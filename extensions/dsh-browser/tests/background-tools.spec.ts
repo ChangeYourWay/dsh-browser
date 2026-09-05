@@ -148,6 +148,35 @@ describe('dispatchToolCall', () => {
     }, { documentId: 'document-7' })
   })
 
+  it('does not retry or roll back a dispatched action when its response port closes', async () => {
+    const chromeMock = mockChrome({
+      tab: { id: 7, url: 'https://example.com/form' },
+      responses: [new Error('The message port closed before a response was received.')],
+    })
+    const commitAction = vi.fn()
+    const rollbackActionCommit = vi.fn()
+
+    const answer = await dispatchToolCall(
+      { id: 'port-closed', name: 'browser_press', args: { key: 'Enter' } },
+      'auto',
+      undefined,
+      async () => 'approved',
+      undefined,
+      undefined,
+      undefined,
+      { unrestrictedAccess: true, commitAction, rollbackActionCommit },
+    )
+
+    expect(answer).toMatchObject({
+      ok: false,
+      error: { code: 'content-unavailable', message: expect.stringContaining('operation was dispatched') },
+    })
+    expect(commitAction).toHaveBeenCalledOnce()
+    expect(rollbackActionCommit).not.toHaveBeenCalled()
+    expect(chromeMock.sendMessage).toHaveBeenCalledOnce()
+    expect(chromeMock.executeScript).not.toHaveBeenCalled()
+  })
+
   it('returns browser-level metadata without injecting into Chrome internal pages', async () => {
     const chromeMock = mockChrome({
       tab: { id: 8, windowId: 3, title: 'Extensions', url: 'chrome://extensions' },
@@ -168,7 +197,7 @@ describe('dispatchToolCall', () => {
   it('falls back to browser-level metadata when recovery injection is blocked', async () => {
     mockChrome({
       tab: { id: 9, url: 'https://chromewebstore.google.com/detail/example' },
-      responses: [new Error('no receiver')],
+      responses: [new Error('Could not establish connection. Receiving end does not exist.')],
       injectionError: new Error('Cannot access contents of the page'),
     })
 
